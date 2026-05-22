@@ -1,0 +1,7 @@
+# Python
+.venv/
+__pycache__/
+
+# Artifacts & Data
+artifacts/
+data/audio_out/
