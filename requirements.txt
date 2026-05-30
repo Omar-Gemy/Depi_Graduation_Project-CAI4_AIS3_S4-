@@ -1,0 +1,23 @@
+# Dubly ME — Phase B & C: Speaker Layer + ASR
+# Requirements for Windows Environment
+
+torch==2.1.2
+torchaudio==2.1.2
+numpy<2.0
+packaging
+soundfile
+
+# Phase C: ASR / Transcription
+faster-whisper
+
+# Phase D: Translation & Adaptation (offline LLM)
+transformers>=4.37.0
+accelerate
+bitsandbytes       # 4-bit quantization support
+sentencepiece      # tokenizer backend for some models
+
+# FFmpeg is a SYSTEM dependency — not installed via pip.
+# Install it separately:
+#    Windows : winget install FFmpeg
+#    macOS   : brew install ffmpeg
+#    Linux   : sudo apt install ffmpeg
