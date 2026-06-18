@@ -16,8 +16,15 @@ accelerate
 bitsandbytes       # 4-bit quantization support
 sentencepiece      # tokenizer backend for some models
 
+# Phase E: Voice Cloning & TTS
+TTS                # Coqui TTS — includes XTTS v2
+soundfile          # audio I/O for WAV verification
+
+# Phase F: Mix & Render (post-processing)
+numpy<2.0           # audio timeline assembly & signal processing
+
 # FFmpeg is a SYSTEM dependency — not installed via pip.
-# Install it separately:
+# Install it separately and ensure it is on PATH:
 #    Windows : winget install FFmpeg
 #    macOS   : brew install ffmpeg
 #    Linux   : sudo apt install ffmpeg
