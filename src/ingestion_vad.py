@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -66,40 +67,92 @@ def read_audio(path: str, sampling_rate: int = 16000) -> torch.Tensor:
 
 # ──────────────────────────────────────────────
 #  Step 1 — Audio extraction & normalisation
+#  (two-pass LINEAR EBU R128 — preserves SNR)
 # ──────────────────────────────────────────────
 def extract_and_normalize_audio(
     input_path: str,
     output_path: str,
     sample_rate: int = 16000,
+    target_i: float = -16.0,
+    target_tp: float = -1.5,
+    target_lra: float = 11.0,
 ) -> str:
     """
     Use FFmpeg to:
       • strip any video track
       • convert to 16-bit PCM mono WAV at *sample_rate* Hz
-      • apply EBU R128 loudness normalisation (loudnorm filter)
+      • apply EBU R128 loudness normalisation (**two-pass LINEAR mode**)
+
+    Two-pass linear mode applies a single constant gain offset rather
+    than dynamically pumping the volume — this preserves the original
+    signal-to-noise ratio and avoids amplifying the background noise floor.
 
     Returns the *output_path* on success; raises RuntimeError otherwise.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    cmd = [
+    # ── Pass 1: Analyse loudness (no output file) ─────────
+    loudnorm_filter = (
+        f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}"
+        f":print_format=json"
+    )
+
+    analyse_cmd = [
         "ffmpeg",
-        "-y",                       # overwrite without asking
+        "-y",
         "-i", input_path,
-        "-vn",                      # drop video stream
-        "-acodec", "pcm_s16le",     # 16-bit signed little-endian PCM
-        "-ar", str(sample_rate),    # target sample rate
-        "-ac", "1",                 # mono
-        "-af", "loudnorm",          # EBU R128 loudness normalisation
+        "-vn",
+        "-af", loudnorm_filter,
+        "-f", "null",
+        "-",
+    ]
+
+    pass1 = subprocess.run(analyse_cmd, capture_output=True, text=True)
+    if pass1.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg loudnorm analysis (pass 1) failed.\n"
+            f"stderr:\n{pass1.stderr}"
+        )
+
+    # Extract the JSON stats block from stderr
+    json_match = re.search(r"\{[^{}]+\}", pass1.stderr, re.DOTALL)
+    if not json_match:
+        raise RuntimeError(
+            "Could not extract loudnorm measurement JSON from FFmpeg.\n"
+            f"stderr:\n{pass1.stderr}"
+        )
+    stats = json.loads(json_match.group())
+
+    # ── Pass 2: Apply linear normalisation ────────────────
+    linear_filter = (
+        f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}"
+        f":measured_I={stats['input_i']}"
+        f":measured_TP={stats['input_tp']}"
+        f":measured_LRA={stats['input_lra']}"
+        f":measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}"
+        f":linear=true"
+    )
+
+    apply_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-af", linear_filter,
         output_path,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    pass2 = subprocess.run(apply_cmd, capture_output=True, text=True)
+    if pass2.returncode != 0:
         raise RuntimeError(
-            f"FFmpeg exited with code {result.returncode}.\n"
-            f"stderr:\n{result.stderr}"
+            f"FFmpeg loudnorm application (pass 2) failed.\n"
+            f"stderr:\n{pass2.stderr}"
         )
+
     return output_path
 
 
@@ -130,9 +183,9 @@ def run_vad(
     audio_path: str,
     model,
     utils,
-    threshold: float = 0.5,
+    threshold: float = 0.3,
     min_speech_ms: int = 250,
-    min_silence_ms: int = 100,
+    min_silence_ms: int = 700,
 ):
     """
     Run Silero VAD on a 16 kHz mono WAV file.
@@ -165,7 +218,12 @@ def run_vad(
 # ──────────────────────────────────────────────
 #  Step 4 — Format & persist the data contract
 # ──────────────────────────────────────────────
-def format_segments(speech_timestamps, source_file: str) -> dict:
+def format_segments(
+    speech_timestamps,
+    source_file: str,
+    source_lang: str,
+    target_lang: str,
+) -> dict:
     """
     Build the ``segments.json`` data-contract object.
 
@@ -192,6 +250,8 @@ def format_segments(speech_timestamps, source_file: str) -> dict:
     return {
         "source_file": os.path.basename(source_file),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source_language": source_lang,
+        "target_language": target_lang,
         "vad_model": "silero_vad_v5",
         "vad_threshold": None,        # will be set by caller
         "total_segments": len(segments),
@@ -220,8 +280,8 @@ def main() -> None:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="VAD confidence threshold  (0.0–1.0, default 0.5)",
+        default=0.3,
+        help="VAD confidence threshold  (0.0–1.0, default 0.3)",
     )
     parser.add_argument(
         "--min-speech-ms",
@@ -232,13 +292,23 @@ def main() -> None:
     parser.add_argument(
         "--min-silence-ms",
         type=int,
-        default=100,
-        help="Minimum silence duration in ms to split on  (default 100)",
+        default=700,
+        help="Minimum silence duration in ms to split on  (default 700)",
     )
     parser.add_argument(
         "--output",
         default=str(SEGMENTS_FILE),
         help="Output JSON path  (default: artifacts/segments.json)",
+    )
+    parser.add_argument(
+        "--source-lang",
+        default="auto",
+        help="Source language code (e.g. 'es', 'ar') or 'auto' for detection  (default: auto)",
+    )
+    parser.add_argument(
+        "--target-lang",
+        default="en",
+        help="Target language code for dubbing  (default: en)",
     )
     args = parser.parse_args()
 
@@ -277,7 +347,12 @@ def main() -> None:
     print(f"       ✔ Detected {len(speech_ts)} speech segment(s).")
 
     # ── Format & save data contract ───────────
-    segments_data = format_segments(speech_ts, input_path)
+    segments_data = format_segments(
+        speech_ts,
+        input_path,
+        source_lang=args.source_lang,
+        target_lang=args.target_lang,
+    )
     segments_data["vad_threshold"] = args.threshold
     save_segments(segments_data, args.output)
 

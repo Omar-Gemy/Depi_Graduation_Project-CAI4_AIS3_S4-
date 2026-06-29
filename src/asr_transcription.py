@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -58,6 +59,55 @@ def load_audio(audio_path: str) -> tuple[np.ndarray, int]:
     if data.ndim > 1:
         data = data.mean(axis=1)
     return data, sr
+
+
+# ──────────────────────────────────────────────
+#  Anti-hallucination: post-transcription filter
+# ──────────────────────────────────────────────
+
+# Phrases commonly hallucinated by Whisper on Arabic noisy/silent audio.
+# These are subscription/channel CTAs from YouTube training data, plus
+# phrases observed during Dubly_ME test runs.
+HALLUCINATION_PATTERNS = [
+    "اشتركوا في القناة",
+    "ترجمة نانسي قنقر",
+    "شكراً لكم",
+    "لا تنسوا الاشتراك",
+    "اشتركوا بالقناة",
+    "اشترك في القناة",
+    "اشترك بالقناة",
+    "لا تنسى الاشتراك",
+    "شكرا للمشاهدة",
+    "تابعونا",
+]
+
+
+def is_hallucination(text: str) -> bool:
+    """
+    Return True if *text* looks like a known Whisper hallucination.
+
+    Checks for:
+      1. Known hallucinated phrases (substring match)
+      2. Excessive repetition (same trigram repeated ≥3 times)
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    # Check against known hallucination phrases
+    for pattern in HALLUCINATION_PATTERNS:
+        if pattern in stripped:
+            return True
+
+    # Detect repetition: if any trigram appears ≥3 times
+    words = stripped.split()
+    if len(words) >= 6:
+        trigrams = [" ".join(words[i:i + 3]) for i in range(len(words) - 2)]
+        for tri in set(trigrams):
+            if trigrams.count(tri) >= 3:
+                return True
+
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -122,9 +172,9 @@ def transcribe_segments(
     audio_data: np.ndarray,
     sample_rate: int,
     segments_data: dict,
-    model_size: str = "small",
-    device: str = "auto",
-    compute_type: str = "auto",
+    model_size: str = "large-v3-turbo",
+    device: str = "cuda",
+    compute_type: str = "int8",
     source_lang: str = "auto",
 ) -> dict:
     """
@@ -200,15 +250,34 @@ def transcribe_segments(
             finally:
                 tmp.close()
 
-        # Transcribe — disable Whisper's internal VAD
+        # ── Transcribe with full anti-hallucination guards ──
         whisper_segments, info = model.transcribe(
             audio_input,
-            language=detected_lang,    # force language — prevent cross-lingual hallucination
-            vad_filter=False,          # rely on OUR VAD, not Whisper's
-            without_timestamps=True,   # we already have timestamps
-            beam_size=5,               # wider beam for short segments
-            temperature=0.0,           # greedy — reduces hallucination on short audio
-            initial_prompt="حديث بالعربية عن تحليل البيانات والأداء والإيرادات",
+            language=detected_lang,
+            vad_filter=False,
+            beam_size=5,
+            temperature=0.0,
+
+            # ── Anti-hallucination parameters ──────────────
+            condition_on_previous_text=False,       # prevent cascading hallucination chains
+            no_speech_threshold=0.5,                # stricter silence detection (default 0.6)
+            compression_ratio_threshold=1.8,        # reject repetitive outputs (default 2.4)
+            log_prob_threshold=-0.5,                # reject low-confidence text (default -1.0)
+            repetition_penalty=1.2,                 # penalise repeated tokens in beam search
+
+            # ── Word-level hallucination guard ─────────────
+            word_timestamps=True,                   # required for hallucination_silence_threshold
+            hallucination_silence_threshold=1.5,    # skip hallucinated text in silent gaps >1.5s
+
+            # ── Dialect-anchoring prompt ───────────────────
+            # Anchors Whisper to Egyptian Arabic dialect.
+            # Uses authentic Egyptian colloquial vocabulary
+            # to bias the model away from MSA defaults.
+            initial_prompt=(
+                "ده تسجيل باللهجة المصرية العامية. "
+                "المتحدثين بيتكلموا مصري وبيستخدموا كلمات زي: "
+                "كده، ازاي، عشان، ليه، بتاع، يعني، أيوه، ماشي."
+            ),
         )
 
         # Collect the text from Whisper's output segments
@@ -217,6 +286,17 @@ def transcribe_segments(
             text_parts.append(ws.text.strip())
 
         full_text = " ".join(text_parts).strip()
+
+        # ── Post-transcription hallucination filter ────────
+        if is_hallucination(full_text):
+            seg["text"] = ""
+            seg["_hallucination_filtered"] = full_text  # keep for debugging
+            # Clean up temp file if we created one
+            if sample_rate != 16000 and isinstance(audio_input, str):
+                os.unlink(audio_input)
+            print(f"⚠ hallucination filtered: \"{full_text[:50]}…\"")
+            continue
+
         seg["text"] = full_text
 
         # Clean up temp file if we created one
@@ -267,9 +347,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="small",
-        choices=["tiny", "base", "small", "medium", "large-v3", "distil-large-v3"],
-        help="Whisper model size  (default: small)",
+        default="large-v3-turbo",
+        choices=["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"],
+        help="Whisper model size  (default: large-v3-turbo)",
     )
     parser.add_argument(
         "--source-lang",
@@ -278,13 +358,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--device",
-        default="auto",
-        help="Compute device: 'cpu', 'cuda', or 'auto'  (default: auto)",
+        default="cuda",
+        help="Compute device: 'cpu', 'cuda', or 'auto'  (default: cuda)",
     )
     parser.add_argument(
         "--compute-type",
-        default="auto",
-        help="CTranslate2 compute type: 'int8', 'float16', 'float32', or 'auto'  (default: auto)",
+        default="int8",
+        help="CTranslate2 compute type: 'int8', 'float16', 'float32', or 'auto'  (default: int8)",
     )
     args = parser.parse_args()
 
