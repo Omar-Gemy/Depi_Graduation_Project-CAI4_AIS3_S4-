@@ -6,7 +6,7 @@ Offline speech-to-text transcription using faster-whisper
 
 Pipeline:
   1. Load the normalised audio and the VAD-generated segments.json
-  2. Detect source language (or accept explicit --source-lang)
+  2. Load language registry and resolve source language config
   3. For each segment, slice the audio by start_time / end_time
   4. Pass each audio slice to faster-whisper with language forcing
   5. Populate the ``text`` field in every segment
@@ -38,6 +38,106 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 DEFAULT_AUDIO = PROJECT_ROOT / "data" / "audio_out" / "_temp_normalised.wav"
 DEFAULT_SEGMENTS = ARTIFACTS_DIR / "segments.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "transcripts.json"
+LANGUAGE_REGISTRY_PATH = PROJECT_ROOT / "config" / "language_registry.json"
+
+
+# ──────────────────────────────────────────────
+#  Language Registry — dynamic config loader
+# ──────────────────────────────────────────────
+REQUIRED_LANG_KEYS = {"name", "whisper_language", "initial_prompt", "hallucination_patterns"}
+
+# Fallback config used when the detected/forced language is not in the registry.
+FALLBACK_LANGUAGE_CONFIG = {
+    "name": "Unknown",
+    "whisper_language": None,  # will be set to the detected code at runtime
+    "initial_prompt": "",
+    "hallucination_patterns": [],
+}
+
+
+def load_language_registry(registry_path: Path = LANGUAGE_REGISTRY_PATH) -> dict:
+    """
+    Load and validate the language registry JSON file.
+
+    Each language entry must contain: name, whisper_language,
+    initial_prompt, and hallucination_patterns.
+
+    Returns the parsed registry dict keyed by language code.
+    Raises SystemExit on I/O or validation errors.
+    """
+    if not registry_path.is_file():
+        print(f"✖  Language registry not found: {registry_path}")
+        sys.exit(1)
+
+    with open(registry_path, "r", encoding="utf-8") as fh:
+        registry = json.load(fh)
+
+    # Validate every language entry
+    for lang_code, config in registry.items():
+        missing = REQUIRED_LANG_KEYS - set(config.keys())
+        if missing:
+            print(
+                f"✖  Language registry: '{lang_code}' is missing "
+                f"required key(s): {', '.join(sorted(missing))}"
+            )
+            sys.exit(1)
+
+    return registry
+
+
+def resolve_language_config(
+    source_lang_cli: str,
+    segments_data: dict,
+    audio_data: np.ndarray,
+    sample_rate: int,
+    model: "WhisperModel",
+    registry: dict,
+) -> tuple[str, dict, list[str]]:
+    """
+    Determine the locked source language and return its registry config.
+
+    Resolution cascade:
+      1. If CLI --source-lang is explicit and not 'auto', use it.
+      2. Else if segments.json contains source_language and it is not 'auto', use it.
+      3. Else run Whisper language detection on the first 30 s.
+
+    Returns:
+      (language_code, language_config_dict, warnings_list)
+    """
+    warnings = []
+
+    # ── Tier 1: explicit CLI ──────────────────
+    if source_lang_cli and source_lang_cli != "auto":
+        lang_code = source_lang_cli
+        print(f"  ✔ Language forced via CLI: {lang_code}")
+
+    # ── Tier 2: segments.json metadata ────────
+    elif segments_data.get("source_language") and segments_data["source_language"] != "auto":
+        lang_code = segments_data["source_language"]
+        print(f"  ✔ Language from segments.json: {lang_code}")
+
+    # ── Tier 3: auto-detection ────────────────
+    else:
+        print("  Detecting source language from first 30s …")
+        lang_code = detect_language(audio_data, sample_rate, model)
+        print(f"  ✔ Detected language: {lang_code}")
+
+    # ── Look up in registry ───────────────────
+    if lang_code in registry:
+        lang_config = registry[lang_code]
+        print(f"  ✔ Registry config loaded: {lang_config['name']}")
+    else:
+        fallback = dict(FALLBACK_LANGUAGE_CONFIG)
+        fallback["whisper_language"] = lang_code
+        lang_config = fallback
+        warn_msg = (
+            f"Language '{lang_code}' not found in registry — "
+            f"using fallback config (no initial_prompt, no hallucination patterns)"
+        )
+        warnings.append(warn_msg)
+        print(f"  ⚠ {warn_msg}")
+
+    return lang_code, lang_config, warnings
 
 
 # ──────────────────────────────────────────────
@@ -65,37 +165,21 @@ def load_audio(audio_path: str) -> tuple[np.ndarray, int]:
 #  Anti-hallucination: post-transcription filter
 # ──────────────────────────────────────────────
 
-# Phrases commonly hallucinated by Whisper on Arabic noisy/silent audio.
-# These are subscription/channel CTAs from YouTube training data, plus
-# phrases observed during Dubly_ME test runs.
-HALLUCINATION_PATTERNS = [
-    "اشتركوا في القناة",
-    "ترجمة نانسي قنقر",
-    "شكراً لكم",
-    "لا تنسوا الاشتراك",
-    "اشتركوا بالقناة",
-    "اشترك في القناة",
-    "اشترك بالقناة",
-    "لا تنسى الاشتراك",
-    "شكرا للمشاهدة",
-    "تابعونا",
-]
-
-
-def is_hallucination(text: str) -> bool:
+def is_hallucination(text: str, hallucination_patterns: list[str]) -> bool:
     """
     Return True if *text* looks like a known Whisper hallucination.
 
     Checks for:
-      1. Known hallucinated phrases (substring match)
+      1. Known hallucinated phrases (substring match) from the
+         language-specific registry patterns.
       2. Excessive repetition (same trigram repeated ≥3 times)
     """
     stripped = text.strip()
     if not stripped:
         return False
 
-    # Check against known hallucination phrases
-    for pattern in HALLUCINATION_PATTERNS:
+    # Check against language-specific hallucination phrases
+    for pattern in hallucination_patterns:
         if pattern in stripped:
             return True
 
@@ -182,10 +266,10 @@ def transcribe_segments(
     faster-whisper transcription.  Whisper's internal VAD is disabled
     so we rely strictly on our Silero-based timestamps.
 
-    If *source_lang* is ``"auto"``, the first 30 s of audio are used
-    to detect the language.  The detected (or provided) language is
-    then forced on every segment to prevent cross-lingual
-    hallucinations.
+    Language config (initial_prompt, hallucination_patterns) is loaded
+    dynamically from config/language_registry.json. If the resolved
+    language is not in the registry, a fallback config is used with
+    empty prompt/patterns and a warning is recorded in the output.
 
     Returns a new dict with populated ``text`` fields, suitable for
     writing to ``transcripts.json``.
@@ -198,17 +282,34 @@ def transcribe_segments(
     )
     print("  ✔ Model loaded.\n")
 
-    # ── Language identification ───────────────
-    if source_lang == "auto":
-        print("  Detecting source language from first 30s …")
-        detected_lang = detect_language(audio_data, sample_rate, model)
-        print(f"  ✔ Detected language: {detected_lang}\n")
-    else:
-        detected_lang = source_lang
-        print(f"  ✔ Language forced to: {detected_lang}\n")
+    # ── Load language registry ────────────────
+    registry = load_language_registry()
+
+    # ── Resolve language config (3-tier cascade) ──
+    detected_lang, lang_config, lang_warnings = resolve_language_config(
+        source_lang_cli=source_lang,
+        segments_data=segments_data,
+        audio_data=audio_data,
+        sample_rate=sample_rate,
+        model=model,
+        registry=registry,
+    )
+    print()
+
+    # Extract language-specific settings from registry config
+    initial_prompt = lang_config["initial_prompt"]
+    hallucination_patterns = lang_config["hallucination_patterns"]
+    whisper_language = lang_config["whisper_language"] or detected_lang
 
     # Store in the data contract for downstream stages
     segments_data["source_language"] = detected_lang
+    segments_data["language_config"] = {
+        "name": lang_config["name"],
+        "registry_language": detected_lang,
+        "used_fallback": detected_lang not in registry,
+    }
+    if lang_warnings:
+        segments_data["language_config"]["warnings"] = lang_warnings
 
     segments = segments_data["segments"]
     total = len(segments)
@@ -251,9 +352,8 @@ def transcribe_segments(
                 tmp.close()
 
         # ── Transcribe with full anti-hallucination guards ──
-        whisper_segments, info = model.transcribe(
-            audio_input,
-            language=detected_lang,
+        transcribe_kwargs = dict(
+            language=whisper_language,
             vad_filter=False,
             beam_size=5,
             temperature=0.0,
@@ -268,17 +368,14 @@ def transcribe_segments(
             # ── Word-level hallucination guard ─────────────
             word_timestamps=True,                   # required for hallucination_silence_threshold
             hallucination_silence_threshold=1.5,    # skip hallucinated text in silent gaps >1.5s
-
-            # ── Dialect-anchoring prompt ───────────────────
-            # Anchors Whisper to Egyptian Arabic dialect.
-            # Uses authentic Egyptian colloquial vocabulary
-            # to bias the model away from MSA defaults.
-            initial_prompt=(
-                "ده تسجيل باللهجة المصرية العامية. "
-                "المتحدثين بيتكلموا مصري وبيستخدموا كلمات زي: "
-                "كده، ازاي، عشان، ليه، بتاع، يعني، أيوه، ماشي."
-            ),
         )
+
+        # ── Dynamic dialect-anchoring prompt ──────────────
+        # Loaded from language registry instead of hardcoded.
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = initial_prompt
+
+        whisper_segments, info = model.transcribe(audio_input, **transcribe_kwargs)
 
         # Collect the text from Whisper's output segments
         text_parts = []
@@ -288,7 +385,7 @@ def transcribe_segments(
         full_text = " ".join(text_parts).strip()
 
         # ── Post-transcription hallucination filter ────────
-        if is_hallucination(full_text):
+        if is_hallucination(full_text, hallucination_patterns):
             seg["text"] = ""
             seg["_hallucination_filtered"] = full_text  # keep for debugging
             # Clean up temp file if we created one
