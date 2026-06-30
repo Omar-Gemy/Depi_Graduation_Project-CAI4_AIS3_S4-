@@ -183,9 +183,10 @@ def run_vad(
     audio_path: str,
     model,
     utils,
-    threshold: float = 0.3,
-    min_speech_ms: int = 250,
-    min_silence_ms: int = 700,
+    threshold: float = 0.20,
+    min_speech_ms: int = 200,
+    min_silence_ms: int = 400,
+    speech_pad_ms: int = 250,
 ):
     """
     Run Silero VAD on a 16 kHz mono WAV file.
@@ -209,7 +210,8 @@ def run_vad(
         threshold=threshold,
         min_speech_duration_ms=min_speech_ms,
         min_silence_duration_ms=min_silence_ms,
-        return_seconds=True,          # gives float seconds directly
+        speech_pad_ms=speech_pad_ms,   # protect against clipped onsets/offsets
+        return_seconds=True,           # gives float seconds directly
     )
 
     return speech_timestamps, SAMPLING_RATE
@@ -280,20 +282,26 @@ def main() -> None:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.3,
-        help="VAD confidence threshold  (0.0–1.0, default 0.3)",
+        default=0.20,
+        help="VAD confidence threshold  (0.0–1.0, default 0.20)",
     )
     parser.add_argument(
         "--min-speech-ms",
         type=int,
-        default=250,
-        help="Minimum speech duration in ms to keep  (default 250)",
+        default=200,
+        help="Minimum speech duration in ms to keep  (default 200)",
     )
     parser.add_argument(
         "--min-silence-ms",
         type=int,
-        default=700,
-        help="Minimum silence duration in ms to split on  (default 700)",
+        default=400,
+        help="Minimum silence duration in ms to split on  (default 400)",
+    )
+    parser.add_argument(
+        "--speech-pad-ms",
+        type=int,
+        default=250,
+        help="Padding added to each side of detected speech  (default 250)",
     )
     parser.add_argument(
         "--output",
@@ -334,7 +342,8 @@ def main() -> None:
         f"[3/3]  Running VAD  "
         f"(threshold={args.threshold}, "
         f"min_speech={args.min_speech_ms}ms, "
-        f"min_silence={args.min_silence_ms}ms)…"
+        f"min_silence={args.min_silence_ms}ms, "
+        f"speech_pad={args.speech_pad_ms}ms)…"
     )
     speech_ts, _sr = run_vad(
         normalised_wav,
@@ -343,6 +352,7 @@ def main() -> None:
         threshold=args.threshold,
         min_speech_ms=args.min_speech_ms,
         min_silence_ms=args.min_silence_ms,
+        speech_pad_ms=args.speech_pad_ms,
     )
     print(f"       ✔ Detected {len(speech_ts)} speech segment(s).")
 

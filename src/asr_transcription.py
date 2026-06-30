@@ -260,6 +260,7 @@ def transcribe_segments(
     device: str = "cuda",
     compute_type: str = "int8",
     source_lang: str = "auto",
+    rms_gate_db: float = -35.0,
 ) -> dict:
     """
     For each segment in *segments_data*, slice the audio and run
@@ -334,6 +335,19 @@ def transcribe_segments(
             print("⚠ empty slice, skipped.")
             continue
 
+        # ── RMS energy gate ──────────────────────────
+        # Skip ASR on segments with near-silence audio to prevent
+        # Whisper from hallucinating fluent text on noise-floor input.
+        rms = np.sqrt(np.mean(chunk ** 2))
+        rms_db = 20 * np.log10(rms) if rms > 0 else -120.0
+        seg["_rms_dbfs"] = round(rms_db, 1)
+
+        if rms_db < rms_gate_db:
+            seg["text"] = ""
+            seg["_skipped_low_energy"] = True
+            print(f"⚠ skipped (RMS {rms_db:.1f} dBFS < {rms_gate_db} dBFS)")
+            continue
+
         # faster-whisper can accept a numpy array directly,
         # but it must be float32 mono at the model's expected rate (16 kHz).
         # If our audio is already 16 kHz mono (from ingestion), we can
@@ -361,7 +375,7 @@ def transcribe_segments(
             # ── Anti-hallucination parameters ──────────────
             condition_on_previous_text=False,       # prevent cascading hallucination chains
             no_speech_threshold=0.5,                # stricter silence detection (default 0.6)
-            compression_ratio_threshold=1.8,        # reject repetitive outputs (default 2.4)
+            compression_ratio_threshold=1.6,        # reject repetitive outputs (default 2.4, prev 1.8)
             log_prob_threshold=-0.5,                # reject low-confidence text (default -1.0)
             repetition_penalty=1.2,                 # penalise repeated tokens in beam search
 
@@ -384,15 +398,22 @@ def transcribe_segments(
 
         full_text = " ".join(text_parts).strip()
 
-        # ── Post-transcription hallucination filter ────────
+        # ── Post-transcription hallucination filter (energy-gated) ──
         if is_hallucination(full_text, hallucination_patterns):
-            seg["text"] = ""
-            seg["_hallucination_filtered"] = full_text  # keep for debugging
-            # Clean up temp file if we created one
-            if sample_rate != 16000 and isinstance(audio_input, str):
-                os.unlink(audio_input)
-            print(f"⚠ hallucination filtered: \"{full_text[:50]}…\"")
-            continue
+            if rms_db < -30.0:
+                # Low-energy audio + pattern match → confident hallucination
+                seg["text"] = ""
+                seg["_hallucination_filtered"] = full_text
+                # Clean up temp file if we created one
+                if sample_rate != 16000 and isinstance(audio_input, str):
+                    os.unlink(audio_input)
+                print(f"⚠ hallucination filtered: \"{full_text[:50]}…\"")
+                continue
+            else:
+                # High-energy audio + pattern match → flag for review,
+                # keep the text (may be a false positive like segment 25)
+                seg["_hallucination_suspect"] = True
+                seg["_hallucination_matched_pattern"] = full_text
 
         seg["text"] = full_text
 
@@ -402,7 +423,21 @@ def transcribe_segments(
 
         # Truncate for display
         preview = full_text[:60] + "…" if len(full_text) > 60 else full_text
-        print(f"✔ \"{preview}\"")
+        suspect_tag = " ⚠suspect" if seg.get("_hallucination_suspect") else ""
+        print(f"✔ \"{preview}\"{suspect_tag}")
+
+    # ── Cross-segment duplicate detection ─────────
+    # Catch prompt-leakage and repetition loops that span multiple segments.
+    seen_texts = {}
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        if text in seen_texts:
+            seg["_duplicate_of_segment"] = seen_texts[text]
+            seg["_hallucination_suspect"] = True
+        else:
+            seen_texts[text] = seg["segment_id"]
 
     return segments_data
 
@@ -463,6 +498,12 @@ def main() -> None:
         default="int8",
         help="CTranslate2 compute type: 'int8', 'float16', 'float32', or 'auto'  (default: int8)",
     )
+    parser.add_argument(
+        "--rms-gate-db",
+        type=float,
+        default=-35.0,
+        help="RMS energy gate in dBFS — segments below this are skipped  (default: -35.0)",
+    )
     args = parser.parse_args()
 
     # ── Validate inputs ──────────────────────
@@ -495,6 +536,7 @@ def main() -> None:
         device=args.device,
         compute_type=args.compute_type,
         source_lang=args.source_lang,
+        rms_gate_db=args.rms_gate_db,
     )
 
     # ── Step 4: Save output ──────────────────
