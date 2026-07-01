@@ -1,0 +1,34 @@
+# Dubly ME — Colab Runtime Dependencies
+# ========================================
+# This file is the Colab counterpart of requirements.txt.
+# It omits torch/torchaudio (pre-installed in the Colab runtime
+# and matched to the VM's CUDA version).
+#
+# Install with:
+#   pip install -r requirements-colab.txt
+
+# ── Core (already in Colab runtime but pinned for safety) ──
+numpy<2.0
+
+# ── Audio I/O ──
+soundfile                  # WAV read/write (libsndfile backend on Linux)
+
+# ── Phase B: Speaker Diarization ──
+# ⚠ Requires HF_TOKEN set in Colab secrets
+pyannote.audio>=3.1
+
+# ── Phase C: ASR / Transcription ──
+faster-whisper             # CTranslate2-backed Whisper inference
+
+# ── Phase D: Translation & Adaptation (offline LLM) ──
+transformers>=4.37.0
+accelerate
+bitsandbytes               # 4-bit quantisation (Linux wheels only — correct for Colab)
+sentencepiece              # tokeniser backend
+
+# ── Phase E: Voice Cloning & TTS ──
+TTS                        # Coqui TTS — includes XTTS v2
+
+# ── System dependency reminder ──────────────────────────
+# FFmpeg is pre-installed on Colab GPU runtimes.
+# Verify with:  !ffmpeg -version
