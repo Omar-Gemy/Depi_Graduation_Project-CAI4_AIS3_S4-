@@ -1,45 +1,45 @@
 {
-  "ar": {
-    "name": "Arabic (Egyptian)",
-    "whisper_language": "ar",
-    "initial_prompt": "ده تسجيل باللهجة المصرية العامية. المتحدثين بيتكلموا مصري وبيستخدموا كلمات زي: كده، ازاي، عشان، ليه، بتاع، يعني، أيوه، ماشي.",
-    "hallucination_patterns": [
-      "اشتركوا في القناة",
-      "ترجمة نانسي قنقر",
-      "شكراً لكم",
-      "لا تنسوا الاشتراك",
-      "اشتركوا بالقناة",
-      "اشترك في القناة",
-      "اشترك بالقناة",
-      "لا تنسى الاشتراك",
-      "شكرا للمشاهدة",
-      "تابعونا"
-    ]
-  },
-  "en": {
-    "name": "English",
-    "whisper_language": "en",
-    "initial_prompt": "This is a clean, professional transcript in English with proper punctuation and capitalization.",
-    "hallucination_patterns": [
-      "Subscribe to my channel",
-      "Thanks for watching",
-      "Don't forget to subscribe",
-      "Like and subscribe",
-      "Hit the bell icon",
-      "Thank you for watching"
-    ]
-  },
-  "es": {
-    "name": "Spanish",
-    "whisper_language": "es",
-    "initial_prompt": "Esta es una transcripción limpia y profesional en español con puntuación correcta.",
-    "hallucination_patterns": [
-      "Suscríbete al canal",
-      "Gracias por ver",
-      "No olvides suscribirte",
-      "Dale like y suscríbete",
-      "Subtítulos realizados por",
-      "Subtítulos por la comunidad"
-    ]
-  }
+    "ar": {
+        "name": "Arabic (Egyptian)",
+        "whisper_language": "ar",
+        "initial_prompt": "ده تسجيل باللهجة المصرية العامية. المتحدثين بيتكلموا مصري وبيستخدموا كلمات زي: كده، ازاي، عشان، ليه، بتاع، يعني، أيوه، ماشي.",
+        "hallucination_patterns": [
+            "اشتركوا في القناة",
+            "ترجمة نانسي قنقر",
+            "شكراً لكم",
+            "لا تنسوا الاشتراك",
+            "اشتركوا بالقناة",
+            "اشترك في القناة",
+            "اشترك بالقناة",
+            "لا تنسى الاشتراك",
+            "شكرا للمشاهدة",
+            "تابعونا"
+        ]
+    },
+    "en": {
+        "name": "English",
+        "whisper_language": "en",
+        "initial_prompt": "This is a clean, professional transcript in English with proper punctuation and capitalization.",
+        "hallucination_patterns": [
+            "Subscribe to my channel",
+            "Thanks for watching",
+            "Don't forget to subscribe",
+            "Like and subscribe",
+            "Hit the bell icon",
+            "Thank you for watching"
+        ]
+    },
+    "es": {
+        "name": "Spanish",
+        "whisper_language": "es",
+        "initial_prompt": "Esta es una transcripción limpia y profesional en español con puntuación correcta.",
+        "hallucination_patterns": [
+            "Suscríbete al canal",
+            "Gracias por ver",
+            "No olvides suscribirte",
+            "Dale like y suscríbete",
+            "Subtítulos realizados por",
+            "Subtítulos por la comunidad"
+        ]
+    }
 }

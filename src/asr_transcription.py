@@ -258,9 +258,10 @@ def transcribe_segments(
     segments_data: dict,
     model_size: str = "large-v3-turbo",
     device: str = "cuda",
-    compute_type: str = "int8",
+    compute_type: str = "float16",
     source_lang: str = "auto",
     rms_gate_db: float = -35.0,
+    min_segment_sec: float = 0.5,
 ) -> dict:
     """
     For each segment in *segments_data*, slice the audio and run
@@ -335,6 +336,17 @@ def transcribe_segments(
             print("⚠ empty slice, skipped.")
             continue
 
+        # ── Duration guard ───────────────────────────
+        # Sub-segments shorter than min_segment_sec (default 0.5s)
+        # have a ~73% hallucination rate after diarization splitting.
+        # Skip them entirely to prevent prompt-leakage and
+        # training-data echo artefacts.
+        if duration < min_segment_sec:
+            seg["text"] = ""
+            seg["_skipped_too_short"] = True
+            print(f"⚠ skipped (duration {duration:.3f}s < {min_segment_sec}s)")
+            continue
+
         # ── RMS energy gate ──────────────────────────
         # Skip ASR on segments with near-silence audio to prevent
         # Whisper from hallucinating fluent text on noise-floor input.
@@ -369,8 +381,8 @@ def transcribe_segments(
         transcribe_kwargs = dict(
             language=whisper_language,
             vad_filter=False,
-            beam_size=5,
-            temperature=0.0,
+            beam_size=8,
+            temperature=[0.0, 0.2, 0.4],
 
             # ── Anti-hallucination parameters ──────────────
             condition_on_previous_text=False,       # prevent cascading hallucination chains
@@ -481,7 +493,7 @@ def main() -> None:
         "--model",
         default="large-v3-turbo",
         choices=["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"],
-        help="Whisper model size  (default: large-v3-turbo)",
+        help="Whisper model size  (default: large-v3)",
     )
     parser.add_argument(
         "--source-lang",
@@ -495,14 +507,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--compute-type",
-        default="int8",
-        help="CTranslate2 compute type: 'int8', 'float16', 'float32', or 'auto'  (default: int8)",
+        default="float16",
+        help="CTranslate2 compute type: 'int8', 'float16', 'float32', or 'auto'  (default: float16)",
     )
     parser.add_argument(
         "--rms-gate-db",
         type=float,
         default=-35.0,
         help="RMS energy gate in dBFS — segments below this are skipped  (default: -35.0)",
+    )
+    parser.add_argument(
+        "--min-segment-sec",
+        type=float,
+        default=0.5,
+        help="Minimum segment duration (seconds) — shorter segments are skipped  (default: 0.5)",
     )
     args = parser.parse_args()
 
@@ -537,6 +555,7 @@ def main() -> None:
         compute_type=args.compute_type,
         source_lang=args.source_lang,
         rms_gate_db=args.rms_gate_db,
+        min_segment_sec=args.min_segment_sec,
     )
 
     # ── Step 4: Save output ──────────────────
