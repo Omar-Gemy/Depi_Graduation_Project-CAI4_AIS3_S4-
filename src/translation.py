@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 DEFAULT_INPUT = ARTIFACTS_DIR / "transcripts.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "translation.json"
-DEFAULT_MODEL = "Qwen/Qwen2-7B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 # ──────────────────────────────────────────────
 #  Heuristic thresholds
@@ -162,12 +162,24 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
 #  Step 3 — LLM-based contextual translation
 # ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are a professional dubbing translator translating Egyptian Arabic "
-    "to English. You receive the previous segment for context, but you must "
-    "ONLY output the English translation of the current segment. "
-    "Produce natural, spoken-style English suitable for dubbing. "
-    "Ignore any obvious ASR hallucinations or artifacts in the source text. "
-    "Output ONLY the translated text, nothing else."
+    "You are a professional dubbing translator specialising in Isochronous "
+    "Translation from Egyptian Arabic to English.\n\n"
+    "CORE RULES:\n"
+    "1. LENGTH MATCHING (critical): Your English translation MUST have "
+    "approximately the SAME number of syllables as the original Arabic "
+    "segment. This is essential because the translated audio will be "
+    "lip-synced to the original speaker's mouth movements. If the source "
+    "has ~12 syllables, your translation must also have ~12 syllables. "
+    "Prefer shorter synonyms, contractions, and natural spoken phrasing "
+    "to match the length.\n"
+    "2. SPOKEN STYLE: Produce natural, conversational English suitable "
+    "for voice-over dubbing. Avoid written-style or overly formal phrasing.\n"
+    "3. CONTEXT: You receive the previous segment for continuity, but you "
+    "must ONLY output the English translation of the CURRENT segment.\n"
+    "4. ROBUSTNESS: Silently ignore any obvious ASR hallucinations or "
+    "artifacts in the source text.\n"
+    "5. OUTPUT: Return ONLY the translated text. No explanations, no "
+    "notes, no syllable counts, no extra formatting."
 )
 
 
