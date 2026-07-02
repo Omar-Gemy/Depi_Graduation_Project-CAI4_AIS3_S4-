@@ -464,7 +464,12 @@ def save_transcripts(data: dict, output_path: str) -> None:
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
+        def np_encoder(obj):
+            if isinstance(obj, np.generic):
+                return obj.item()
+            raise TypeError
+
+        json.dump(data, fh, indent=2, ensure_ascii=False, default=np_encoder)
 
 
 # ──────────────────────────────────────────────

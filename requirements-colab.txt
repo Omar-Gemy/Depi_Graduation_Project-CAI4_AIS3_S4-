@@ -27,7 +27,7 @@ bitsandbytes               # 4-bit quantisation (Linux wheels only — correct f
 sentencepiece              # tokeniser backend
 
 # ── Phase E: Voice Cloning & TTS ──
-TTS                        # Coqui TTS — includes XTTS v2
+#TTS                        # Coqui TTS — includes XTTS v2
 
 # ── System dependency reminder ──────────────────────────
 # FFmpeg is pre-installed on Colab GPU runtimes.
