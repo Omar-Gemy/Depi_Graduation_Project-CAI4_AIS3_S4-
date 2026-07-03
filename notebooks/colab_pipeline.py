@@ -2,13 +2,15 @@
 """
 colab_pipeline.py — Dubly ME: Sequential Colab Pipeline (Phases A–D)
 =====================================================================
-Run this script cell-by-cell in Google Colab (GPU runtime).
+Run this script cell-by-cell in Google Colab (GPU runtime, T4 recommended).
 Each section is delimited with  # %%  for easy copy-paste into .ipynb.
 
 Architecture:
   - Google Drive is mounted for persistent storage of models and artifacts.
   - HF_HOME is pointed at Drive so heavy LLMs are never re-downloaded.
   - Each phase invokes the corresponding CLI script from  src/ .
+  - All source code and dependencies are pulled from the GitHub repo —
+    no manual patches needed.
 """
 
 # %% [Cell 0] Environment Setup — Mount Drive, Cache Models, Install Deps
@@ -45,18 +47,19 @@ except Exception:
     print("⚠ Could not load HF_TOKEN from Colab Secrets.")
     print("  Set it manually:  os.environ['HF_TOKEN'] = 'hf_your_token'")
 
-# ── 0.4  Sync the project repo to the Colab VM ─────────────────────
+# ── 0.4  Sync the project repo to the Colab VM (via Git) ────────────
 REPO_DIR = "/content/Dubly_ME"
-DRIVE_REPO = f"{STORAGE_ROOT}/Dubly_ME"
+GIT_URL = "https://github.com/Omar-Gemy/Dubly_ME.git"
+BRANCH = "feature/cloud-pipeline"
 
-if os.path.isdir(DRIVE_REPO):
-    # Symlink from Drive to the expected working directory
-    if not os.path.exists(REPO_DIR):
-        os.symlink(DRIVE_REPO, REPO_DIR)
-    print(f"✔ Repo linked: {DRIVE_REPO} → {REPO_DIR}")
+if not os.path.exists(REPO_DIR):
+    print(f"▶ Cloning repo from {GIT_URL} (branch: {BRANCH})...")
+    subprocess.run(["git", "clone", "-b", BRANCH, GIT_URL, REPO_DIR], check=True)
+    print("✔ Repo cloned successfully.")
 else:
-    print(f"✖ Repo not found on Drive at: {DRIVE_REPO}")
-    print("  Upload your project to Google Drive first.")
+    print("▶ Pulling latest changes...")
+    subprocess.run(["git", "pull", "origin", BRANCH], cwd=REPO_DIR, check=True)
+    print("✔ Repo updated successfully.")
 
 # ── 0.5  Install dependencies ──────────────────────────────────────
 subprocess.run(
@@ -114,7 +117,7 @@ print("═" * 60)
 
 # %% [Cell 2] Phase B — Speaker Diarization
 """
-Assign speaker identities to VAD segments using the pyannote.audio 3.1
+Assign speaker identities to VAD segments using the pyannote.audio 4.x
 ensemble (Segmentation → Embedding → Clustering).
 
 Script:   src/diarization.py

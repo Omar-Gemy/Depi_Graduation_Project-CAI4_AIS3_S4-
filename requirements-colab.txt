@@ -1,6 +1,6 @@
-# Dubly ME — Colab Runtime Dependencies (Opus Optimized for Colab T4)
+# Dubly ME — Colab Runtime Dependencies (pyannote 4.x / Colab T4)
 soundfile
-pyannote.audio==3.3.2
+pyannote.audio==4.0.7
 faster-whisper==1.2.1
 ctranslate2>=4.5.0,<5.0
 transformers>=4.43.0,<6.0
