@@ -256,7 +256,7 @@ def transcribe_segments(
     audio_data: np.ndarray,
     sample_rate: int,
     segments_data: dict,
-    model_size: str = "large-v3-turbo",
+    model_size: str = "large-v3",
     device: str = "cuda",
     compute_type: str = "float16",
     source_lang: str = "auto",
@@ -496,7 +496,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="large-v3-turbo",
+        default="large-v3",
         choices=["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"],
         help="Whisper model size  (default: large-v3)",
     )

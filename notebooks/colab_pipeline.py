@@ -162,7 +162,7 @@ print("▶ Phase C: ASR Transcription")
 subprocess.run(
     [
         "python", f"{REPO_DIR}/src/asr_transcription.py",
-        "--model", "large-v3-turbo",
+        "--model", "large-v3",
         "--source-lang", "ar",
         "--device", "cuda",
         "--compute-type", "float16",
@@ -181,7 +181,7 @@ print("═" * 60)
 Translate Arabic transcripts to English using Qwen2.5-7B-Instruct with
 isochronous (length-aware) translation for video dubbing.
 
-The model is loaded in 4-bit quantization (NF4) and cached on Google Drive
+The model is loaded in 8-bit quantization (LLM.int8) and cached on Google Drive
 via HF_HOME to prevent re-downloading on subsequent sessions.
 
 Script:   src/translation.py
