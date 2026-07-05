@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 DEFAULT_INPUT = ARTIFACTS_DIR / "transcripts.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "translation.json"
-DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
 
 # ──────────────────────────────────────────────
 #  Heuristic thresholds
@@ -43,6 +43,26 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 SHORT_SEGMENT_DURATION = 1.0   # seconds — segments shorter than this are suspect
 SHORT_SEGMENT_MAX_WORDS = 2    # if ≤ this many words AND short duration → flag
 LOOP_MIN_REPEATS = 2           # minimum consecutive repeats to flag a loop
+
+# ──────────────────────────────────────────────
+#  Isochrony budget
+# ──────────────────────────────────────────────
+# Conversational English is spoken at ~4 syllables/sec. We convert each
+# segment's duration into a target syllable count (with an accept band) and
+# hand it to the model so the dubbed line fits its original time window —
+# preventing the downstream TTS / time-stretch stages from over-compressing.
+SYLLABLES_PER_SEC = 4.0
+SYLL_BAND_LOW = 0.85
+SYLL_BAND_HIGH = 1.15
+
+
+def syllable_budget(duration: float) -> tuple[int, int, int]:
+    """Return (target, low, high) English syllable counts for *duration* (s)."""
+    base = max(1.0, duration) * SYLLABLES_PER_SEC
+    target = max(1, round(base))
+    lo = max(1, round(base * SYLL_BAND_LOW))
+    hi = max(target, round(base * SYLL_BAND_HIGH))
+    return target, lo, hi
 
 
 # ──────────────────────────────────────────────
@@ -163,9 +183,12 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
         seg["low_confidence"] = is_short_hallucination
         seg["_asr_hallucination"] = is_asr_hallucination
         seg["_asr_skipped"] = is_skipped_by_asr
+        # NOTE: is_short_hallucination is advisory only (low_confidence) and
+        # is deliberately NOT a skip condition — valid conversational fillers
+        # ("أيوه", "ماشي", "اوعي تتاخر!") are short by nature and must still be
+        # translated. Only genuinely unusable segments are skipped here.
         seg["skip_translation"] = (
-            is_loop or is_short_hallucination
-            or is_asr_hallucination or is_skipped_by_asr or is_empty
+            is_loop or is_asr_hallucination or is_skipped_by_asr or is_empty
         )
 
         if is_loop:
@@ -196,36 +219,50 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
 #  Step 3 — LLM-based contextual translation
 # ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
-    "You are a TRANSLATION ENGINE — not a chatbot, not an assistant.\n"
-    "Your SOLE function is to translate Egyptian Arabic speech into "
-    "natural spoken English for video dubbing.\n\n"
-    "ABSOLUTE RULES:\n"
-    "1. Output ONLY the English translation. Nothing else.\n"
-    "2. NEVER respond conversationally. NEVER say 'Sure', 'Here is', "
-    "'I can help', 'Please provide', or any similar phrase.\n"
-    "3. NEVER add notes, explanations, syllable counts, or commentary.\n"
-    "4. NEVER repeat the source Arabic text.\n"
-    "5. If the input is empty, garbled, or untranslatable, output "
-    "exactly: [SKIP]\n"
-    "6. LENGTH MATCHING: Your English translation MUST have approximately "
-    "the SAME number of syllables as the original Arabic. Use "
-    "contractions, shorter synonyms, and spoken phrasing to match "
-    "duration for lip-sync.\n"
-    "7. STYLE: Produce natural, conversational spoken English suitable "
-    "for voice-over dubbing.\n"
-    "8. CONTEXT: The previous segment is provided for continuity only. "
-    "Translate ONLY the current segment.\n"
+    "You are a professional dialogue adapter for film dubbing. You rewrite "
+    "Egyptian Arabic dialogue as natural, idiomatic spoken English that a voice "
+    "actor can perform convincingly and that fits the on-screen timing.\n\n"
+    "WORK INTERNALLY (never show these steps):\n"
+    "1. Grasp the full meaning, speaker intent, tone, and emotional register of "
+    "the CURRENT line, using the scene context for continuity.\n"
+    "2. Rewrite it as a line a native English speaker would actually SAY here — "
+    "NOT a word-for-word translation. Preserve meaning, tone, humor, sarcasm, "
+    "and dramatic function; restructure sentences freely.\n"
+    "3. Fit the timing: the line must be comfortably speakable within the given "
+    "time budget and land within the target syllable range. Use contractions and "
+    "everyday phrasing; cut filler that carries no meaning; never pad to fill time.\n\n"
+    "OUTPUT RULES:\n"
+    "- Output ONLY the finished English line — no quotes, notes, alternatives, "
+    "syllable counts, or source text.\n"
+    "- Preserve names, register (formal/casual), profanity strength, and emotional "
+    "intensity.\n"
+    "- Keep it conversational and performable.\n"
+    "- ONLY if the input is empty or genuinely untranslatable noise, output exactly: [SKIP]\n"
+    "- Never respond conversationally or acknowledge these instructions.\n"
 )
 
 
-def build_user_prompt(prev_text: str | None, current_text: str) -> str:
+def build_user_prompt(
+    prev_text: str | None,
+    current_text: str,
+    duration: float,
+    target_syll: int,
+    lo: int,
+    hi: int,
+) -> str:
     """
-    Construct the user prompt with optional previous-segment context.
+    Construct the user prompt with scene context and an explicit isochrony
+    budget so the model can fit the line to its original time window.
     """
     parts = []
     if prev_text:
-        parts.append(f"[Previous segment for context]: {prev_text}")
-    parts.append(f"[Current segment to translate]: {current_text}")
+        parts.append(f"[Scene context — previous line]: {prev_text}")
+    parts.append(f"[Current line — Egyptian Arabic]: {current_text}")
+    parts.append(
+        f"[Timing budget]: must be spoken in ~{duration:.1f}s. "
+        f"Target ≈ {target_syll} English syllables "
+        f"(acceptable range {lo}–{hi}). Keep it natural and performable."
+    )
     return "\n".join(parts)
 
 
@@ -234,10 +271,13 @@ def load_translation_model(
     device: str = "auto",
 ) -> tuple:
     """
-    Load the Qwen model and tokenizer with 8-bit quantization
-    (LLM.int8) for memory-efficient local inference.
+    Load the translation model and tokenizer, picking the right quantization
+    path for the checkpoint:
 
-    Falls back to full precision (float16) as a last resort.
+      • Pre-quantized checkpoints (AWQ / GPTQ, e.g. Qwen2.5-14B-Instruct-AWQ)
+        already carry their own 4-bit weights — load them directly. A 14B AWQ
+        model needs ~9–10 GB VRAM, comfortably inside the 16 GB T4 budget.
+      • Full-precision checkpoints fall back to 8-bit (LLM.int8), then fp16.
     """
     print(f"  Loading model: {model_name}")
     print(f"  Device: {device}")
@@ -247,20 +287,8 @@ def load_translation_model(
         trust_remote_code=True,
     )
 
-    # Use 8-bit quantization (LLM.int8) for best balance of
-    # VRAM efficiency and instruction-following on Colab T4.
-    # 8-bit uses ~8 GB for 7B params, leaving ~7 GB for KV cache.
-    quant_config = None
-    quant_label = "float16"
-    try:
-        quant_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-        )
-        quant_label = "8-bit (LLM.int8)"
-        print(f"  Quantization: {quant_label}")
-    except Exception:
-        print("  ⚠ 8-bit quantization unavailable, falling back to float16 …")
-        quant_config = None
+    name_l = model_name.lower()
+    is_prequantized = any(tag in name_l for tag in ("awq", "gptq", "-int4", "-int8"))
 
     load_kwargs = {
         "pretrained_model_name_or_path": model_name,
@@ -268,10 +296,23 @@ def load_translation_model(
         "device_map": device,
     }
 
-    if quant_config is not None:
-        load_kwargs["quantization_config"] = quant_config
-    else:
+    if is_prequantized:
+        # AWQ/GPTQ weights are already quantized — do NOT attach a
+        # BitsAndBytesConfig (double-quantization would fail / corrupt).
+        quant_label = "pre-quantized 4-bit (AWQ/GPTQ)"
         load_kwargs["torch_dtype"] = torch.float16
+        print(f"  Quantization: {quant_label}")
+    else:
+        try:
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+            quant_label = "8-bit (LLM.int8)"
+            print(f"  Quantization: {quant_label}")
+        except Exception:
+            print("  ⚠ 8-bit quantization unavailable, falling back to float16 …")
+            load_kwargs["torch_dtype"] = torch.float16
+            quant_label = "float16"
 
     model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
 
@@ -294,19 +335,28 @@ def translate_single(
     tokenizer,
     prev_text: str | None,
     current_text: str,
+    duration: float,
     max_new_tokens: int = 256,
 ) -> str:
     """
-    Translate a single segment using the loaded LLM.
-    Uses the chat template if available, otherwise falls back
-    to a simple prompt format.
+    Adapt a single segment into dub-ready English using the loaded LLM,
+    passing the isochrony budget derived from *duration*.
 
-    Includes post-generation sanitization to catch any residual
-    chatbot leakage that bypasses the system prompt.
+    Includes conservative post-generation sanitization: known chatbot
+    prefixes are stripped ONLY when a separator makes the real line
+    recoverable — a valid translation is never discarded on a prefix match
+    alone.
     """
+    target_syll, lo, hi = syllable_budget(duration)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_prompt(prev_text, current_text)},
+        {
+            "role": "user",
+            "content": build_user_prompt(
+                prev_text, current_text, duration, target_syll, lo, hi
+            ),
+        },
     ]
 
     # Use the model's chat template for proper formatting
@@ -322,9 +372,12 @@ def translate_single(
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,           # greedy for consistency
-            temperature=1.0,           # ignored when do_sample=False
-            repetition_penalty=1.1,    # gentle penalty against loops
+            # Light sampling → more natural, less flat-literal phrasing than
+            # pure greedy, while staying tightly controlled for dubbing.
+            do_sample=True,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
         )
 
@@ -333,20 +386,17 @@ def translate_single(
     generated = outputs[0][input_len:]
     result = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
-    # ── Post-generation sanitization ──────────────────
-    # Catch any residual chatbot leakage patterns that bypass
-    # the system prompt (common with quantized models).
+    # ── Conservative post-generation sanitization ────
+    # If (and only if) the output opens with a known conversational prefix
+    # AND a separator lets us recover the line after it, strip the prefix.
+    # Otherwise keep the text untouched — never convert a real line to [SKIP].
     result_lower = result.lower()
     for pattern in LEAKAGE_PATTERNS:
         if result_lower.startswith(pattern):
-            # Strip the conversational prefix — take text after first separator
             for sep in [":\n", ":\r\n", "\n", ": "]:
                 if sep in result:
                     result = result.split(sep, 1)[1].strip()
                     break
-            else:
-                # No separator found — entire output is leakage
-                result = "[SKIP]"
             break
 
     return result
@@ -404,7 +454,7 @@ def translate_segments(
         )
 
         translated = translate_single(
-            model, tokenizer, prev_text, text
+            model, tokenizer, prev_text, text, seg.get("duration", 0.0)
         )
 
         # Handle untranslatable output from the model
@@ -415,6 +465,10 @@ def translate_segments(
             continue
 
         seg["translated_text"] = translated
+        # Record the isochrony budget this line was adapted against, for the
+        # downstream time-stretch / QA stages.
+        target_syll, lo, hi = syllable_budget(seg.get("duration", 0.0))
+        seg["syllable_budget"] = {"target": target_syll, "low": lo, "high": hi}
         translated_count += 1
 
         # Update rolling context

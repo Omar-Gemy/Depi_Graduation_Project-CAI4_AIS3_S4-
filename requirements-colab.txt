@@ -3,9 +3,14 @@ soundfile
 pyannote.audio==4.0.7
 faster-whisper==1.2.1
 ctranslate2>=4.5.0,<5.0
+# Phase C: ASR — WhisperX adds wav2vec2 forced alignment for word-level
+# timestamps on top of faster-whisper's large-v3 backend.
+whisperx>=3.1.1
 transformers>=4.43.0,<6.0
 accelerate>=1.0.0,<2.0
 bitsandbytes>=0.49.0
+# Phase D: 4-bit AWQ inference for Qwen2.5-14B-Instruct-AWQ
+autoawq>=0.2.7
 sentencepiece>=0.2.0
 protobuf>=4.25.0,<6.0
 onnxruntime>=1.19.0

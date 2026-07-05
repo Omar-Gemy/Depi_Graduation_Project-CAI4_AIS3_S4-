@@ -147,8 +147,9 @@ print("═" * 60)
 
 # %% [Cell 3] Phase C — ASR Transcription
 """
-Transcribe each speech segment using faster-whisper (CTranslate2 backend)
-with language forcing for Arabic.
+Transcribe the full audio in one pass with WhisperX (large-v3 backend),
+run wav2vec2 forced alignment for precise word-level timestamps, then
+intersect words with the diarization segments (global-to-local mapping).
 
 Script:   src/asr_transcription.py
 Input:    data/audio_out/_temp_normalised.wav  +  artifacts/segments.json
@@ -178,11 +179,13 @@ print("═" * 60)
 
 # %% [Cell 4] Phase D — Contextual Translation (Isochronous)
 """
-Translate Arabic transcripts to English using Qwen2.5-7B-Instruct with
-isochronous (length-aware) translation for video dubbing.
+Adapt the Arabic transcripts into natural spoken English for dubbing using
+Qwen2.5-14B-Instruct-AWQ. The model is a pre-quantized 4-bit AWQ checkpoint
+(~9–10 GB VRAM, fits the 16 GB T4) and is cached on Google Drive via HF_HOME
+to prevent re-downloading on subsequent sessions.
 
-The model is loaded in 8-bit quantization (LLM.int8) and cached on Google Drive
-via HF_HOME to prevent re-downloading on subsequent sessions.
+Each line is translated against an explicit isochrony budget (target syllable
+count derived from the segment duration) so the dub fits its time window.
 
 Script:   src/translation.py
 Input:    artifacts/transcripts.json
@@ -196,7 +199,7 @@ print("▶ Phase D: Contextual Translation (Isochronous)")
 subprocess.run(
     [
         "python", f"{REPO_DIR}/src/translation.py",
-        "--model", "Qwen/Qwen2.5-7B-Instruct",
+        "--model", "Qwen/Qwen2.5-14B-Instruct-AWQ",
         "--device", "auto",
     ],
     check=True,
