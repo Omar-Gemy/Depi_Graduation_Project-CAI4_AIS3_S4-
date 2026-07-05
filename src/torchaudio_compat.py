@@ -39,6 +39,7 @@ def apply() -> bool:
 
     if hasattr(torchaudio, "AudioMetaData"):
         apply_backend_shim()
+        apply_torch_load_shim()
         return False
 
     # The class still ships with torchaudio — only its public location moved
@@ -61,6 +62,7 @@ def apply() -> bool:
     torchaudio.AudioMetaData = audio_meta
     print("  [torchaudio_compat] patched torchaudio.AudioMetaData for pyannote 3.1.1")
     apply_backend_shim()
+    apply_torch_load_shim()
     return True
 def apply_backend_shim() -> bool:
     """
@@ -95,3 +97,35 @@ def apply_backend_shim() -> bool:
         print("  [torchaudio_compat] patched torchaudio.list_audio_backends for pyannote 3.1.1")
 
     return patched
+
+def apply_torch_load_shim() -> bool:
+    """
+    Force ``torch.load`` to default to ``weights_only=False``.
+
+    PyTorch >=2.6 changed torch.load's default from False to True. The
+    official pyannote 3.1.1 checkpoints (downloaded from Hugging Face) embed
+    a ``torch.torch_version.TorchVersion`` global that is not in the new
+    default safe-list, so loading fails under the new default. We trust the
+    official HF checkpoint source, so we restore the old default globally.
+
+    Returns True if a patch was applied, False if already patched or torch
+    is unavailable.
+    """
+    try:
+        import torch
+    except Exception:
+        return False
+
+    if getattr(torch.load, "_dubly_patched", False):
+        return False
+
+    _original_load = torch.load
+
+    def _patched_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _original_load(*args, **kwargs)
+
+    _patched_load._dubly_patched = True
+    torch.load = _patched_load
+    print("  [torchaudio_compat] patched torch.load default to weights_only=False for pyannote checkpoints")
+    return True
