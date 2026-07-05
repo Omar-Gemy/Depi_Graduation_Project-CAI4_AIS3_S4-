@@ -16,8 +16,9 @@ soundfile
 pyannote.audio>=3.1
 
 # Phase C: ASR / Transcription
-faster-whisper
-# WhisperX — full-file transcription + wav2vec2 forced alignment (word timestamps)
+# WhisperX handles full-file transcription + wav2vec2 forced alignment and
+# pins compatible faster-whisper / ctranslate2 versions transitively — do NOT
+# pin faster-whisper here (it conflicts with whisperx 3.3.1's own pin).
 whisperx==3.3.1
 
 # Phase D: Translation & Adaptation (offline LLM)

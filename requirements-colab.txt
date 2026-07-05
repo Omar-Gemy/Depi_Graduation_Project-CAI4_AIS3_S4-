@@ -7,10 +7,10 @@
 soundfile
 numpy<2.0
 pyannote.audio==4.0.7
-faster-whisper==1.2.1
-ctranslate2>=4.5.0,<5.0
-# Phase C: ASR — WhisperX adds wav2vec2 forced alignment for word-level
-# timestamps on top of faster-whisper's large-v3 backend.
+# Phase C: ASR — WhisperX adds wav2vec2 forced alignment on top of the
+# faster-whisper (large-v3) backend. WhisperX pins compatible faster-whisper
+# and ctranslate2 versions transitively, so we do NOT pin them here — an
+# explicit faster-whisper==1.2.1 conflicts with whisperx 3.3.1's own pin.
 whisperx==3.3.1
 transformers==4.47.1
 accelerate>=1.1.0,<1.3.0
