@@ -95,7 +95,11 @@ Status:
   post-split, with a `_merged_from` provenance field and a new
   `segments_rejoined` stat in `diarization_stats`.
 
-### Next task — Observation 4 (not started)
+### All 4 observations complete (as of 2026-07-05)
+All committed on feature/architecture-refactor. Next real milestone: run the
+full pipeline end-to-end on Colab (GPU) to get real asr_confidence numbers
+(the current transcripts.json fixture has no persisted word-scores) and
+validate all 4 fixes against actual audio.
 
 Surface ASR confidence in `src/asr_transcription.py`:
 - Add `asr_confidence` (aggregated from faster-whisper/whisperx's existing
