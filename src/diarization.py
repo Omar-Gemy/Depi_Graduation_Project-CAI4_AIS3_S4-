@@ -39,6 +39,11 @@ from typing import Optional
 import torch
 import torchaudio
 
+# WhisperX 3.3.1 forces pyannote.audio 3.1.1, which breaks on recent torchaudio
+# (missing torchaudio.AudioMetaData). Patch it before pyannote is imported.
+import torchaudio_compat
+torchaudio_compat.apply()
+
 # ──────────────────────────────────────────────
 #  Logging
 # ──────────────────────────────────────────────
@@ -280,10 +285,13 @@ def run_diarization(
 
     diarization = pipeline(audio_input, **pipeline_kwargs)
 
-    # pyannote 4.x returns a DiarizeOutput dataclass;
-    # the Annotation object is under .speaker_diarization
+    # pyannote 4.x returns a DiarizeOutput dataclass (Annotation under
+    # .speaker_diarization); pyannote 3.1.x returns the Annotation directly.
+    # WhisperX 3.3.1 pins 3.1.1, so support both shapes.
+    annotation = getattr(diarization, "speaker_diarization", diarization)
+
     turns = []
-    for turn, _track, speaker in diarization.speaker_diarization.itertracks(yield_label=True):
+    for turn, _track, speaker in annotation.itertracks(yield_label=True):
         turns.append({
             "start": round(turn.start, 3),
             "end": round(turn.end, 3),

@@ -356,6 +356,10 @@ def transcribe_full_file(
     Returns *segments_data* with populated ``text`` fields.
     """
     import torch
+    # WhisperX pulls pyannote 3.1.1 for its VAD; patch torchaudio.AudioMetaData
+    # before whisperx (→ pyannote) imports, or the import raises on new torchaudio.
+    import torchaudio_compat
+    torchaudio_compat.apply()
     import whisperx
 
     # ── Normalise device / compute_type ───────────
