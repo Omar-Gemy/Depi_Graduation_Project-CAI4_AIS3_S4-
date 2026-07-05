@@ -1,16 +1,22 @@
 # Dubly ME — Colab Runtime Dependencies (pyannote 4.x / Colab T4)
+# ─────────────────────────────────────────────────────────────────
+# Jointly-compatible pin set for WhisperX (alignment) + AutoAWQ (Phase D).
+# transformers is held < 4.49 so transformers.activations.PytorchGELUTanh
+# (imported by AutoAWQ) still exists; 4.47.1 is the version AutoAWQ 0.2.8 is
+# validated against and is well inside WhisperX (>=4.19) and pyannote 4.x range.
 soundfile
+numpy<2.0
 pyannote.audio==4.0.7
 faster-whisper==1.2.1
 ctranslate2>=4.5.0,<5.0
 # Phase C: ASR — WhisperX adds wav2vec2 forced alignment for word-level
 # timestamps on top of faster-whisper's large-v3 backend.
-whisperx>=3.1.1
-transformers>=4.43.0,<6.0
-accelerate>=1.0.0,<2.0
-bitsandbytes>=0.49.0
+whisperx==3.3.1
+transformers==4.47.1
+accelerate>=1.1.0,<1.3.0
+bitsandbytes>=0.44.0
 # Phase D: 4-bit AWQ inference for Qwen2.5-14B-Instruct-AWQ
-autoawq>=0.2.7
+autoawq==0.2.8
 sentencepiece>=0.2.0
 protobuf>=4.25.0,<6.0
 onnxruntime>=1.19.0

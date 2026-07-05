@@ -50,7 +50,7 @@ except Exception:
 # ── 0.4  Sync the project repo to the Colab VM (via Git) ────────────
 REPO_DIR = "/content/Dubly_ME"
 GIT_URL = "https://github.com/Omar-Gemy/Dubly_ME.git"
-BRANCH = "feature/cloud-pipeline"
+BRANCH = "feature/architecture-refactor"
 
 if not os.path.exists(REPO_DIR):
     print(f"▶ Cloning repo from {GIT_URL} (branch: {BRANCH})...")

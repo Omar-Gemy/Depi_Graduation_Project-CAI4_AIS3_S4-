@@ -210,30 +210,126 @@ def is_hallucination(text: str, hallucination_patterns: list[str]) -> bool:
 
 
 # ──────────────────────────────────────────────
+#  Post-transcription gating thresholds (tunable via CLI)
+# ──────────────────────────────────────────────
+# WhisperX transcribes the FULL file (global context preserved). The gate
+# below is a post-hoc filter that decides which words/segments are committed,
+# restoring the protection the old per-slice path had while keeping context.
+MIN_ALIGN_SCORE = 0.30      # wav2vec2 word-confidence floor
+MIN_ASSIGN_OVERLAP = 0.50   # a word must be ≥50% inside a segment to attach
+RMS_GATE_DB = -35.0         # segments quieter than this are treated as noise
+MIN_SEGMENT_SEC = 0.50      # drop sub-second fragments
+
+
+def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Duration of temporal overlap between [a0, a1] and [b0, b1]."""
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def build_speech_intervals(segments: list[dict]) -> list[tuple[float, float]]:
+    """
+    Merge the diarization segment spans into sorted, non-overlapping speech
+    intervals — our trusted (VAD + diarization) speech mask.
+    """
+    spans = sorted(
+        (s["start_time"], s["end_time"])
+        for s in segments
+        if s["end_time"] > s["start_time"]
+    )
+    merged: list[tuple[float, float]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+# ──────────────────────────────────────────────
 #  Global-to-Local: map aligned words → segments
 # ──────────────────────────────────────────────
-def assign_words_to_segments(
+def assign_words_to_segments_by_overlap(
     segments: list[dict],
     words: list[dict],
-) -> list[dict]:
+    min_overlap_frac: float = MIN_ASSIGN_OVERLAP,
+) -> int:
     """
-    Populate each segment's ``text`` field with the aligned words whose
-    midpoint falls inside the segment's [start_time, end_time] window.
+    Attach each word to the diarization segment that covers the LARGEST
+    fraction of the word's span (≥ *min_overlap_frac*).
 
-    Using the word midpoint (rather than raw overlap) gives each word to
-    exactly one segment and is robust to small alignment jitter at
-    boundaries.
+    Max-overlap (relative to the word duration — NOT IoU, which would
+    penalise a short word inside a long segment) is robust to alignment
+    boundary drift: a word straddling a turn boundary goes to the dominant
+    speaker, and a rapid short turn keeps its own words even under jitter.
+
+    Words overlapping no segment (gap / background speech between turns) are
+    dropped. Returns the count of dropped words.
     """
     for seg in segments:
-        start = seg["start_time"]
-        end = seg["end_time"]
-        tokens = [
-            w["word"]
-            for w in words
-            if start <= (w["start"] + w["end"]) / 2.0 <= end
-        ]
-        seg["text"] = " ".join(tokens).strip()
-    return segments
+        seg["_bucket"] = []
+
+    dropped = 0
+    for w in words:
+        wdur = max(1e-6, w["end"] - w["start"])
+        best_seg = None
+        best_ov = 0.0
+        for seg in segments:
+            ov = _overlap(w["start"], w["end"], seg["start_time"], seg["end_time"])
+            if ov > best_ov:
+                best_ov = ov
+                best_seg = seg
+        if best_seg is not None and (best_ov / wdur) >= min_overlap_frac:
+            best_seg["_bucket"].append(w["word"])
+        else:
+            dropped += 1
+
+    for seg in segments:
+        seg["text"] = " ".join(seg.pop("_bucket")).strip()
+    return dropped
+
+
+def apply_segment_gates(
+    segments: list[dict],
+    audio: np.ndarray,
+    sample_rate: int = 16000,
+    rms_gate_db: float = RMS_GATE_DB,
+    min_segment_sec: float = MIN_SEGMENT_SEC,
+) -> dict:
+    """
+    Re-apply the old energy / duration gate to the assembled segments, using
+    the in-memory audio (no extra I/O). Segments quieter than *rms_gate_db* or
+    shorter than *min_segment_sec* have their text cleared and are flagged for
+    the downstream translation stage.
+
+    Returns a small stats dict for run instrumentation.
+    """
+    n_energy = 0
+    n_short = 0
+    for seg in segments:
+        if not (seg.get("text") or "").strip():
+            continue
+
+        if (seg["end_time"] - seg["start_time"]) < min_segment_sec:
+            seg["text"] = ""
+            seg["_skipped_too_short"] = True
+            n_short += 1
+            continue
+
+        a = max(0, int(seg["start_time"] * sample_rate))
+        b = min(len(audio), int(seg["end_time"] * sample_rate))
+        chunk = audio[a:b]
+        if len(chunk) == 0:
+            continue
+
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        rms_db = 20.0 * np.log10(rms) if rms > 0 else -120.0
+        seg["_rms_dbfs"] = round(rms_db, 1)
+        if rms_db < rms_gate_db:
+            seg["text"] = ""
+            seg["_skipped_low_energy"] = True
+            n_energy += 1
+
+    return {"gated_low_energy": n_energy, "gated_too_short": n_short}
 
 
 # ──────────────────────────────────────────────
@@ -248,6 +344,10 @@ def transcribe_full_file(
     source_lang: str = "auto",
     batch_size: int = 16,
     align_model_name: str | None = None,
+    min_align_score: float = MIN_ALIGN_SCORE,
+    min_overlap_frac: float = MIN_ASSIGN_OVERLAP,
+    rms_gate_db: float = RMS_GATE_DB,
+    min_segment_sec: float = MIN_SEGMENT_SEC,
 ) -> dict:
     """
     Transcribe the whole audio file with WhisperX, force-align to word level,
@@ -351,7 +451,7 @@ def transcribe_full_file(
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    # ── Flatten aligned words (absolute timestamps) ──
+    # ── Flatten aligned words (keep confidence score) ──
     words: list[dict] = []
     for seg in aligned["segments"]:
         for w in seg.get("words", []):
@@ -360,12 +460,45 @@ def transcribe_full_file(
                 continue
             token = (w.get("word") or "").strip()
             if token:
-                words.append({"word": token, "start": w["start"], "end": w["end"]})
-    print(f"  ✔ {len(words)} aligned word(s) across the file")
+                words.append(
+                    {
+                        "word": token,
+                        "start": w["start"],
+                        "end": w["end"],
+                        "score": w.get("score"),
+                    }
+                )
+    n_raw = len(words)
+    print(f"  ✔ {n_raw} aligned word(s) across the file")
 
-    # ── Global-to-local mapping onto diarization segments ──
+    # ── Tier 1a — word-confidence gate ────────────
+    # wav2vec2 assigns low alignment scores to uncertain tokens, which are
+    # frequently noise-driven. Drop them before assignment.
+    words = [
+        w for w in words
+        if w["score"] is None or w["score"] >= min_align_score
+    ]
+    n_low_conf = n_raw - len(words)
+
+    # ── Tier 1b / 2 — max-overlap assignment ──────
+    # Words are attached to the diarization segment covering the largest
+    # fraction of their span; words overlapping NO trusted segment (i.e.
+    # background speech in the gaps between turns) are dropped here.
     segments = segments_data["segments"]
-    assign_words_to_segments(segments, words)
+    n_dropped = assign_words_to_segments_by_overlap(
+        segments, words, min_overlap_frac=min_overlap_frac
+    )
+
+    # ── Tier 3 — energy + duration gate ───────────
+    # Catches low-SNR background bleed INSIDE a trusted window and sub-second
+    # fragments, using the in-memory audio (16 kHz mono from ingestion).
+    gate_stats = apply_segment_gates(
+        segments,
+        audio,
+        sample_rate=16000,
+        rms_gate_db=rms_gate_db,
+        min_segment_sec=min_segment_sec,
+    )
 
     # ── Prompt-echo + hallucination guards ────────
     n_echo = 0
@@ -390,6 +523,10 @@ def transcribe_full_file(
             n_suspect += 1
 
     print(f"  ✔ Segments with text     : {n_filled}/{len(segments)}")
+    print(f"  ⚠ Low-confidence words   : {n_low_conf}")
+    print(f"  ⚠ Words dropped (no-overlap/background): {n_dropped}")
+    print(f"  ⚠ Gated (low energy)     : {gate_stats['gated_low_energy']}")
+    print(f"  ⚠ Gated (too short)      : {gate_stats['gated_too_short']}")
     print(f"  ⚠ Prompt-echo filtered   : {n_echo}")
     print(f"  ⚠ Hallucination suspects : {n_suspect}")
 
@@ -402,6 +539,22 @@ def transcribe_full_file(
     }
     if lang_warnings:
         segments_data["language_config"]["warnings"] = lang_warnings
+
+    # ── Gating instrumentation (committed to transcripts.json) ──
+    segments_data["gate_stats"] = {
+        "words_raw": n_raw,
+        "words_low_confidence": n_low_conf,
+        "words_dropped_no_overlap": n_dropped,
+        "prompt_echo_filtered": n_echo,
+        "hallucination_suspects": n_suspect,
+        **gate_stats,
+        "thresholds": {
+            "min_align_score": min_align_score,
+            "min_overlap_frac": min_overlap_frac,
+            "rms_gate_db": rms_gate_db,
+            "min_segment_sec": min_segment_sec,
+        },
+    }
 
     return segments_data
 
@@ -481,6 +634,31 @@ def main() -> None:
             "wav2vec2). Default: WhisperX's built-in model for the language."
         ),
     )
+    # ── Post-transcription gating knobs (set to a disabling value to ablate) ──
+    parser.add_argument(
+        "--min-align-score",
+        type=float,
+        default=MIN_ALIGN_SCORE,
+        help=f"wav2vec2 word-confidence floor; set 0 to disable  (default: {MIN_ALIGN_SCORE})",
+    )
+    parser.add_argument(
+        "--min-overlap-frac",
+        type=float,
+        default=MIN_ASSIGN_OVERLAP,
+        help=f"Min fraction of a word inside a segment to attach it; 0 disables gap-dropping  (default: {MIN_ASSIGN_OVERLAP})",
+    )
+    parser.add_argument(
+        "--rms-gate-db",
+        type=float,
+        default=RMS_GATE_DB,
+        help=f"Segment RMS energy gate in dBFS; set -120 to disable  (default: {RMS_GATE_DB})",
+    )
+    parser.add_argument(
+        "--min-segment-sec",
+        type=float,
+        default=MIN_SEGMENT_SEC,
+        help=f"Minimum segment duration in seconds; set 0 to disable  (default: {MIN_SEGMENT_SEC})",
+    )
     args = parser.parse_args()
 
     # ── Validate inputs ──────────────────────
@@ -509,6 +687,10 @@ def main() -> None:
         source_lang=args.source_lang,
         batch_size=args.batch_size,
         align_model_name=args.align_model,
+        min_align_score=args.min_align_score,
+        min_overlap_frac=args.min_overlap_frac,
+        rms_gate_db=args.rms_gate_db,
+        min_segment_sec=args.min_segment_sec,
     )
 
     # ── Step 4: Save output ──────────────────

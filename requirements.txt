@@ -18,14 +18,17 @@ pyannote.audio>=3.1
 # Phase C: ASR / Transcription
 faster-whisper
 # WhisperX — full-file transcription + wav2vec2 forced alignment (word timestamps)
-whisperx>=3.1.1
+whisperx==3.3.1
 
 # Phase D: Translation & Adaptation (offline LLM)
-transformers>=4.37.0
-accelerate
-bitsandbytes       # 4-bit quantization support
-autoawq            # AWQ 4-bit inference for Qwen2.5-14B-Instruct-AWQ
-sentencepiece      # tokenizer backend for some models
+# Pinned so AutoAWQ (0.2.8) and WhisperX share one transformers build:
+# transformers is held at 4.47.1 so transformers.activations.PytorchGELUTanh
+# (imported by AutoAWQ) still exists — it was removed in 4.49.
+transformers==4.47.1
+accelerate>=1.1.0,<1.3.0
+bitsandbytes>=0.44.0   # 4-bit quantization support
+autoawq==0.2.8         # AWQ 4-bit inference for Qwen2.5-14B-Instruct-AWQ (GPU/Linux)
+sentencepiece          # tokenizer backend for some models
 
 # Phase E: Voice Cloning & TTS
 TTS                # Coqui TTS — includes XTTS v2
