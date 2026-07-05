@@ -6,7 +6,7 @@
 # validated against and is well inside WhisperX (>=4.19) and pyannote 4.x range.
 soundfile
 numpy<2.0
-pyannote.audio==4.0.7
+pyannote.audio
 # Phase C: ASR — WhisperX adds wav2vec2 forced alignment on top of the
 # faster-whisper (large-v3) backend. WhisperX pins compatible faster-whisper
 # and ctranslate2 versions transitively, so we do NOT pin them here — an
