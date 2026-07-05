@@ -20,7 +20,7 @@ import argparse
 import copy
 import json
 import os
-import re
+import string
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,13 +36,98 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 DEFAULT_INPUT = ARTIFACTS_DIR / "transcripts.json"
 DEFAULT_OUTPUT = ARTIFACTS_DIR / "translation.json"
 DEFAULT_MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+DEFAULT_GLOSSARY = PROJECT_ROOT / "config" / "name_glossary.json"
+
+
+# ──────────────────────────────────────────────
+#  Name / terminology glossary
+# ──────────────────────────────────────────────
+def load_name_glossary(path: str | Path = DEFAULT_GLOSSARY) -> list[dict]:
+    """
+    Load the proper-noun glossary (canonical Arabic→English spellings).
+
+    Non-fatal: a missing or malformed file returns an empty list with a
+    warning, so translation still runs — the glossary is an enhancement, not
+    a hard dependency. Each returned entry has at least 'ar' and 'en'; an
+    optional 'variants' list holds alternate Arabic surface forms.
+    """
+    path = Path(path)
+    if not path.is_file():
+        print(f"       ⚠ No name glossary at {path} — proceeding without one.")
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        entries = data.get("names", [])
+        # Keep only well-formed entries.
+        clean = [e for e in entries if e.get("ar") and e.get("en")]
+        print(f"       ✔ Name glossary loaded: {len(clean)} entries.")
+        return clean
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"       ⚠ Could not read glossary {path}: {exc} — proceeding without one.")
+        return []
+
+
+def _entry_surface_forms(entry: dict) -> list[str]:
+    """All Arabic surface forms for a glossary entry (canonical + variants)."""
+    forms = [entry["ar"]] + list(entry.get("variants") or [])
+    # Longer forms first so 'عم شوقي' is matched before bare 'شوقي'.
+    return sorted({f for f in forms if f}, key=len, reverse=True)
+
+
+def relevant_glossary_entries(
+    entries: list[dict],
+    *texts: str,
+) -> list[dict]:
+    """
+    Return the glossary entries whose canonical form or any variant appears
+    in any of *texts* (the current line, plus scene context). Restricting the
+    injected glossary to names actually present keeps the prompt tight.
+    """
+    haystack = " ".join(t for t in texts if t)
+    hits = []
+    for entry in entries:
+        if any(form in haystack for form in _entry_surface_forms(entry)):
+            hits.append(entry)
+    return hits
+
+
+def format_glossary_directive(entries: list[dict]) -> str:
+    """
+    Render glossary *entries* as an instruction block for the system prompt.
+    Returns "" when there are no entries so the prompt is unchanged.
+    """
+    if not entries:
+        return ""
+    lines = [
+        "\nTERMINOLOGY — use these EXACT English spellings for proper nouns; "
+        "never vary or re-transliterate them:",
+    ]
+    for e in entries:
+        forms = " / ".join(_entry_surface_forms(e))
+        line = f"- {forms} → {e['en']}"
+        if e.get("note"):
+            line += f"  ({e['note']})"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 # ──────────────────────────────────────────────
 #  Heuristic thresholds
 # ──────────────────────────────────────────────
 SHORT_SEGMENT_DURATION = 1.0   # seconds — segments shorter than this are suspect
 SHORT_SEGMENT_MAX_WORDS = 2    # if ≤ this many words AND short duration → flag
-LOOP_MIN_REPEATS = 2           # minimum consecutive repeats to flag a loop
+# Loop detection operates on WHOLE tokens (never sub-word substrings). Natural
+# Egyptian reduplication repeats a word only 2–3× ("حاضر حاضر", "زن زن زن"); a
+# real Whisper decode loop repeats many times. So we only *suspect* a loop at
+# ≥ LOOP_MIN_REPEATS and only *skip* an egregious one at ≥ LOOP_SKIP_REPEATS.
+LOOP_MIN_REPEATS = 4           # ≥ this many consecutive repeats → suspected loop (advisory)
+LOOP_SKIP_REPEATS = 6          # ≥ this many → egregious loop, safe to hard-skip
+LOOP_MIN_TOKEN_LEN = 2         # ignore single-character tokens (stray ا/ه/و) as loop units
+# Punctuation stripped from token edges before loop comparison, so that a
+# repeated word does not read as distinct just because one instance carries a
+# trailing mark ("زن زن زن." → three equal "زن", not two + "زن."). Covers ASCII
+# punctuation plus common Arabic marks.
+LOOP_STRIP_CHARS = string.punctuation + "،؛؟…«»ـ" + "‏‎"
 
 # ──────────────────────────────────────────────
 #  Isochrony budget
@@ -77,51 +162,61 @@ def load_transcripts(path: str) -> dict:
 # ──────────────────────────────────────────────
 #  Step 2 — Pre-processing heuristics
 # ──────────────────────────────────────────────
-def detect_whisper_loop(text: str) -> bool:
+def max_consecutive_repeat(text: str) -> int:
     """
-    Detect consecutive word or phrase repetitions that indicate
-    a Whisper decoding loop (e.g. "والأداء والأداء والأداء").
+    Return the length of the longest run of a WHOLE token (or 2-/3-token
+    phrase) repeated consecutively.
 
-    Strategy:
-      1. Split into words, check if entire text is one word repeated.
-      2. Check for repeated bigrams / trigrams that cover most of the text.
-      3. Use regex to find any token repeated ≥ LOOP_MIN_REPEATS times
-         consecutively.
+    Operates strictly on whitespace-split tokens — never on sub-word
+    substrings — so it cannot false-fire on a word that merely ends with the
+    same letter the next word begins with (e.g. "ده هيقعد", which the old regex
+    misread as a "ه ه" loop). Edge punctuation is stripped before comparison so
+    a mark on one instance ("زن زن زن.") does not hide the repeat, and
+    single-character tokens are ignored as repeat units, since stray one-letter
+    ASR artefacts (ا/ه/و) are not decode loops.
+    """
+    raw = text.strip().split() if text else []
+    # Normalise: strip edge punctuation, drop tokens that become empty.
+    words = [tok for tok in (w.strip(LOOP_STRIP_CHARS) for w in raw) if tok]
+    if len(words) < 2:
+        return 0
+
+    best = 1
+
+    # Unigram, bigram, trigram phrase repeats.
+    for n in (1, 2, 3):
+        if len(words) < 2 * n:
+            continue
+        ngrams = [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
+        i = 0
+        while i < len(ngrams):
+            # Skip degenerate single-character unigram units.
+            if n == 1 and len(ngrams[i]) < LOOP_MIN_TOKEN_LEN:
+                i += 1
+                continue
+            run = 1
+            j = i + n  # step by n so phrase repeats don't overlap
+            while j < len(ngrams) and ngrams[j] == ngrams[i]:
+                run += 1
+                j += n
+            best = max(best, run)
+            i += 1
+
+    return best
+
+
+def detect_whisper_loop(text: str, min_repeats: int = LOOP_MIN_REPEATS) -> bool:
+    """
+    Return True if *text* contains a token/phrase repeated ≥ *min_repeats*
+    times consecutively — the signature of a Whisper decode loop
+    (e.g. "والأداء والأداء والأداء والأداء").
+
+    Natural Egyptian reduplication ("حاضر حاضر", "كده كده", "زن زن زن") repeats
+    only 2–3×, so the default threshold of 4 leaves it untouched.
     """
     if not text or not text.strip():
         return False
-
-    words = text.strip().split()
-
-    # Case 1: All words are the same
-    if len(words) >= LOOP_MIN_REPEATS and len(set(words)) == 1:
-        return True
-
-    # Case 2: Repeated n-grams (bigrams and trigrams)
-    for n in (2, 3):
-        if len(words) < n * LOOP_MIN_REPEATS:
-            continue
-        ngrams = [
-            " ".join(words[i : i + n]) for i in range(len(words) - n + 1)
-        ]
-        # Check if any n-gram appears consecutively
-        for i in range(len(ngrams) - 1):
-            consecutive = 1
-            for j in range(i + 1, len(ngrams)):
-                if ngrams[j] == ngrams[i]:
-                    consecutive += 1
-                else:
-                    break
-            if consecutive >= LOOP_MIN_REPEATS:
-                return True
-
-    # Case 3: Regex — any single token repeated consecutively
-    # Matches: "word word" or "والأداء والأداء"
-    pattern = r"(\S+)(?:\s+\1){" + str(LOOP_MIN_REPEATS - 1) + r",}"
-    if re.search(pattern, text):
-        return True
-
-    return False
+    return max_consecutive_repeat(text) >= min_repeats
 
 
 def detect_short_hallucination(text: str, duration: float) -> bool:
@@ -162,6 +257,9 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
         duration = seg.get("duration", 0.0)
 
         is_loop = detect_whisper_loop(text)
+        # Only an EGREGIOUS loop (many repeats) is safe to hard-skip; a merely
+        # suspected loop stays translatable and is flagged for QA instead.
+        is_egregious_loop = detect_whisper_loop(text, min_repeats=LOOP_SKIP_REPEATS)
         is_short_hallucination = detect_short_hallucination(text, duration)
 
         # ── ASR-flagged hallucination suspects ────────
@@ -183,12 +281,13 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
         seg["low_confidence"] = is_short_hallucination
         seg["_asr_hallucination"] = is_asr_hallucination
         seg["_asr_skipped"] = is_skipped_by_asr
-        # NOTE: is_short_hallucination is advisory only (low_confidence) and
-        # is deliberately NOT a skip condition — valid conversational fillers
-        # ("أيوه", "ماشي", "اوعي تتاخر!") are short by nature and must still be
-        # translated. Only genuinely unusable segments are skipped here.
+        # NOTE: a SUSPECTED loop (transcription_failed) is advisory only — it no
+        # longer forces a skip, because the old detector false-fired on ~19% of
+        # valid lines. is_short_hallucination is likewise advisory. Only an
+        # egregious loop, ASR-confirmed hallucination, ASR-skip, or empty text
+        # is dropped from translation.
         seg["skip_translation"] = (
-            is_loop or is_asr_hallucination or is_skipped_by_asr or is_empty
+            is_egregious_loop or is_asr_hallucination or is_skipped_by_asr or is_empty
         )
 
         if is_loop:
@@ -202,7 +301,7 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
         if is_empty:
             flagged_empty += 1
 
-    print(f"       Whisper loops detected  : {flagged_loops}")
+    print(f"       Suspected loops (advisory): {flagged_loops}")
     print(f"       Short hallucinations    : {flagged_short}")
     print(f"       ASR hallucination flags : {flagged_asr_hallucination}")
     print(f"       ASR skipped (energy/dur): {flagged_asr_skipped}")
@@ -337,10 +436,14 @@ def translate_single(
     current_text: str,
     duration: float,
     max_new_tokens: int = 256,
+    glossary_directive: str = "",
 ) -> str:
     """
     Adapt a single segment into dub-ready English using the loaded LLM,
     passing the isochrony budget derived from *duration*.
+
+    *glossary_directive* (optional) is appended to the system prompt to force
+    consistent proper-noun spellings.
 
     Includes conservative post-generation sanitization: known chatbot
     prefixes are stripped ONLY when a separator makes the real line
@@ -349,8 +452,9 @@ def translate_single(
     """
     target_syll, lo, hi = syllable_budget(duration)
 
+    system_content = SYSTEM_PROMPT + glossary_directive
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {
             "role": "user",
             "content": build_user_prompt(
@@ -406,12 +510,15 @@ def translate_segments(
     segments_data: dict,
     model_name: str,
     device: str = "auto",
+    glossary: list[dict] | None = None,
 ) -> dict:
     """
     Translate all valid (non-skipped) segments using the LLM.
-    Each segment receives the previous segment's text as context.
+    Each segment receives the previous segment's text as context, plus any
+    glossary entries whose names appear in the current or previous line.
     """
     model, tokenizer = load_translation_model(model_name, device)
+    glossary = glossary or []
 
     segments = segments_data["segments"]
     total = len(segments)
@@ -453,8 +560,14 @@ def translate_segments(
             flush=True,
         )
 
+        # Inject only the glossary names present in this line or its context,
+        # so recurring characters keep a stable English spelling.
+        directive = format_glossary_directive(
+            relevant_glossary_entries(glossary, text, prev_text or "")
+        )
         translated = translate_single(
-            model, tokenizer, prev_text, text, seg.get("duration", 0.0)
+            model, tokenizer, prev_text, text, seg.get("duration", 0.0),
+            glossary_directive=directive,
         )
 
         # Handle untranslatable output from the model
@@ -526,6 +639,16 @@ def main() -> None:
         default=256,
         help="Max tokens to generate per segment  (default: 256)",
     )
+    parser.add_argument(
+        "--glossary",
+        default=str(DEFAULT_GLOSSARY),
+        help="Path to the name/terminology glossary JSON  (default: config/name_glossary.json)",
+    )
+    parser.add_argument(
+        "--no-glossary",
+        action="store_true",
+        help="Disable proper-noun glossary injection.",
+    )
     args = parser.parse_args()
 
     # ── Validate input ───────────────────────
@@ -539,17 +662,28 @@ def main() -> None:
     n_segs = data["total_segments"]
     print(f"       ✔ {n_segs} segment(s) loaded.")
 
+    # ── Load name glossary (non-fatal) ───────
+    glossary = [] if args.no_glossary else load_name_glossary(args.glossary)
+
     # ── Step 2: Pre-processing heuristics ────
     print(f"\n[2/4]  Running pre-processing heuristics…")
     data["segments"] = preprocess_segments(data["segments"])
 
     # ── Step 3: Contextual translation ───────
     print(f"\n[3/4]  Translating with LLM (model={args.model})…\n")
-    data = translate_segments(data, model_name=args.model, device=args.device)
+    data = translate_segments(
+        data, model_name=args.model, device=args.device, glossary=glossary,
+    )
 
     # ── Step 4: Save output ──────────────────
     print(f"\n[4/4]  Saving translation → {args.output}")
     data["translation_model"] = args.model
+    # Additive contract field — records glossary provenance for this run.
+    data["name_glossary"] = {
+        "path": None if args.no_glossary else str(args.glossary),
+        "entries": len(glossary),
+        "applied": [e["en"] for e in glossary],
+    }
     save_translation(data, args.output)
 
     # ── Summary ──────────────────────────────
