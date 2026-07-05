@@ -68,6 +68,13 @@ DEFAULT_AUDIO = PROJECT_ROOT / "data" / "audio_out" / "_temp_normalised.wav"
 MIN_SUB_SEGMENT_SEC = 0.3   # sub-segments shorter than this are merged
 PYANNOTE_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
 
+# A VAD segment is only split across speakers when a SECONDARY speaker's
+# coverage is substantial — otherwise a brief diarization boundary error would
+# sever a single continuous sentence (observed: seg 17 "…لازم تلاقيه في" | "كل
+# بيت" split onto two speakers). Both conditions must hold to justify a split.
+SPLIT_MIN_SECONDARY_FRAC = 0.25   # ≥25% of the segment's duration, AND
+SPLIT_MIN_SECONDARY_SEC = 0.7     # ≥0.7s of absolute coverage
+
 
 # ══════════════════════════════════════════════
 #  Step 1 — Load inputs
@@ -391,6 +398,7 @@ def intersect_and_split(
     """
     new_segments = []
     split_count = 0
+    dominant_kept_count = 0   # multi-speaker segments NOT split (minor secondary)
 
     for seg in segments:
         seg_start = seg["start_time"]
@@ -423,15 +431,42 @@ def intersect_and_split(
             new_segments.append(result_seg)
             continue
 
-        # ── Case 2: Single speaker ────────────────────────────
-        unique_speakers = set(t["speaker"] for t in overlapping_turns)
-        if len(unique_speakers) == 1:
+        # ── Aggregate per-speaker coverage within this segment ──
+        coverage: dict[str, float] = {}
+        for t in overlapping_turns:
+            coverage[t["speaker"]] = coverage.get(t["speaker"], 0.0) + t["overlap"]
+        unique_speakers = set(coverage)
+        dominant_speaker = max(coverage, key=coverage.get)
+        seg_duration = seg_end - seg_start
+
+        # A secondary speaker justifies a split only if its coverage is BOTH
+        # ≥ SPLIT_MIN_SECONDARY_FRAC of the segment AND ≥ SPLIT_MIN_SECONDARY_SEC.
+        def _justifies_split(spk: str) -> bool:
+            cov = coverage[spk]
+            frac = cov / seg_duration if seg_duration > 0 else 0.0
+            return cov >= SPLIT_MIN_SECONDARY_SEC and frac >= SPLIT_MIN_SECONDARY_FRAC
+
+        secondary_justifies = any(
+            _justifies_split(spk) for spk in unique_speakers if spk != dominant_speaker
+        )
+
+        # ── Case 2: Single speaker, or no secondary speaker meets the
+        #            split threshold → assign whole segment to the dominant. ──
+        if len(unique_speakers) == 1 or not secondary_justifies:
+            if len(unique_speakers) > 1:
+                dominant_kept_count += 1
+                log.info(
+                    "Segment #%d (%.1fs–%.1fs, %.1fs): %d speakers overlap but "
+                    "secondary coverage below threshold — assigning dominant %s",
+                    original_id, seg_start, seg_end, seg["duration"],
+                    len(unique_speakers), dominant_speaker,
+                )
             result_seg = dict(seg)
-            result_seg["speaker_id"] = overlapping_turns[0]["speaker"]
+            result_seg["speaker_id"] = dominant_speaker
             new_segments.append(result_seg)
             continue
 
-        # ── Case 3: Multiple speakers — split at boundaries ──
+        # ── Case 3: Genuine multi-speaker — split at boundaries ──
         split_count += 1
         log.info(
             "Segment #%d (%.1fs–%.1fs, %.1fs): splitting across %d speakers: %s",
@@ -476,8 +511,8 @@ def intersect_and_split(
 
     log.info(
         "Intersection complete: %d input segment(s) → %d output segment(s) "
-        "(%d segment(s) were split)",
-        len(segments), len(new_segments), split_count,
+        "(%d split, %d multi-speaker kept whole)",
+        len(segments), len(new_segments), split_count, dominant_kept_count,
     )
 
     return new_segments
