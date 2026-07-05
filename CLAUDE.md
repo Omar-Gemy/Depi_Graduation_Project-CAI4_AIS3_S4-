@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 1. **Zero third-party APIs.** No commercial/cloud API calls (no DeepL, Google, OpenAI, etc.). Everything runs on self-hosted open models: faster-whisper, Silero VAD, pyannote.audio, Qwen, XTTS v2.
 2. **Every stage emits a JSON data contract** into `artifacts/`. Never skip writing these — they are how stages hand off and how runs are debugged.
-3. **Git workflow:** never push to `main`; branch per feature (current branch: `feature/cloud-pipeline`).
+3. **Git workflow:** never push to `main`; branch per feature (current branch: `feature/architecture-refactor`).
 4. **Keep it modular.** No end-to-end "magic" models — each stage must be independently runnable, testable, and replaceable.
 
 ## Architecture — a linear chain of CLI stages
@@ -74,3 +74,39 @@ Every script accepts `--input`/`--output`/path overrides and defaults to the `ar
 - `artifacts/`, `.venv/`, and `data/audio_out/` are gitignored — the JSON contracts are runtime output, not committed source (the two committed `segments.json`/`transcripts.json` are sample fixtures).
 - Stage scripts use `PROJECT_ROOT = Path(__file__).resolve().parent.parent`-relative paths; run them from anywhere but keep the `src/ … artifacts/ … data/` layout intact.
 - User-facing console output uses ✔/✖/▶/✅ status glyphs and `[n/N]` step counters — match this style when adding stage output.
+
+## Current Session State (2026-07-05) — QA remediation on feature/architecture-refactor
+
+A QA pass over a real 53-segment translation.json test run found 4 issues.
+Status:
+
+- ✅ **Observation 1** (commit `e866115`): fixed `detect_whisper_loop` false-positives
+  in `src/translation.py` — was dropping ~19% of valid segments as false "loops".
+  Now token-based, punctuation-normalized, decoupled advisory-flag-vs-hard-skip.
+- ✅ **Observation 2** (commit `482e31b`): added `config/name_glossary.json` +
+  injection into the translation prompt in `src/translation.py`, for stable
+  character-name transliteration.
+- ✅ **Observation 3 Part A** (commit `424dd18`): raised the diarization
+  split threshold in `src/diarization.py` (`SPLIT_MIN_SECONDARY_FRAC=0.25`,
+  `SPLIT_MIN_SECONDARY_SEC=0.7`) to stop spurious speaker-change splits.
+- ✅ **Observation 3 Part B** (just committed — confirm commit hash with
+  `git log -1 --oneline`): added `rejoin_same_origin_fragments()` in
+  `src/diarization.py` — merges adjacent same-origin/same-speaker fragments
+  post-split, with a `_merged_from` provenance field and a new
+  `segments_rejoined` stat in `diarization_stats`.
+
+### Next task — Observation 4 (not started)
+
+Surface ASR confidence in `src/asr_transcription.py`:
+- Add `asr_confidence` (aggregated from faster-whisper/whisperx's existing
+  word-level alignment scores) and a `low_confidence_asr` flag to the
+  `transcripts.json` output.
+- Additive only — do not change existing fields or the output path.
+
+### Standing process rules for this remediation work
+- One fix per commit. Show the full diff and wait for explicit "approved"
+  before moving to the next task.
+- Never run git yourself (add/commit/push) — the human handles this after
+  reviewing each diff.
+- No `git add .` — explicit files only.
+- Don't touch files outside the current task's stated scope.

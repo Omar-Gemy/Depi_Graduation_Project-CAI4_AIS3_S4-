@@ -219,6 +219,7 @@ MIN_ALIGN_SCORE = 0.30      # wav2vec2 word-confidence floor
 MIN_ASSIGN_OVERLAP = 0.50   # a word must be ≥50% inside a segment to attach
 RMS_GATE_DB = -35.0         # segments quieter than this are treated as noise
 MIN_SEGMENT_SEC = 0.50      # drop sub-second fragments
+LOW_CONFIDENCE_ASR = 0.55   # mean word-confidence below this flags the segment
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
@@ -267,6 +268,9 @@ def assign_words_to_segments_by_overlap(
     """
     for seg in segments:
         seg["_bucket"] = []
+        # Parallel list of per-word alignment scores for the words that land in
+        # this segment; consumed later to compute the segment's asr_confidence.
+        seg["_score_bucket"] = []
 
     dropped = 0
     for w in words:
@@ -280,6 +284,7 @@ def assign_words_to_segments_by_overlap(
                 best_seg = seg
         if best_seg is not None and (best_ov / wdur) >= min_overlap_frac:
             best_seg["_bucket"].append(w["word"])
+            best_seg["_score_bucket"].append(w["score"])
         else:
             dropped += 1
 
@@ -332,6 +337,48 @@ def apply_segment_gates(
     return {"gated_low_energy": n_energy, "gated_too_short": n_short}
 
 
+def aggregate_asr_confidence(
+    segments: list[dict],
+    low_confidence_threshold: float = LOW_CONFIDENCE_ASR,
+) -> dict:
+    """
+    Attach per-segment ASR confidence to every segment (Observation 4).
+
+    ``asr_confidence`` is the mean of the wav2vec2 word-alignment scores for
+    the words that landed in the segment (the ``_score_bucket`` populated
+    during word→segment assignment). ``low_confidence_asr`` is True when the
+    segment carries text whose mean confidence is below
+    *low_confidence_threshold* — a soft, additive advisory flag for the
+    downstream translation/QA stages, never a hard skip.
+
+    Segments with no committed text (empty / gated / echo-filtered) get
+    ``asr_confidence = None`` and ``low_confidence_asr = False``: there is no
+    transcript to be (un)confident about.
+
+    Consumes and removes the transient ``_score_bucket`` scratch field.
+    Returns a small stats dict for run instrumentation.
+    """
+    n_low = 0
+    n_scored = 0
+    for seg in segments:
+        scores = [s for s in seg.pop("_score_bucket", []) if s is not None]
+        has_text = bool((seg.get("text") or "").strip())
+
+        if has_text and scores:
+            confidence = round(float(np.mean(scores)), 3)
+            seg["asr_confidence"] = confidence
+            seg["low_confidence_asr"] = confidence < low_confidence_threshold
+            n_scored += 1
+            if seg["low_confidence_asr"]:
+                n_low += 1
+        else:
+            # No text (or no scored words) → nothing to be confident about.
+            seg["asr_confidence"] = None
+            seg["low_confidence_asr"] = False
+
+    return {"asr_scored": n_scored, "asr_low_confidence": n_low}
+
+
 # ──────────────────────────────────────────────
 #  Steps 2–3 — Full-file transcription + alignment
 # ──────────────────────────────────────────────
@@ -348,6 +395,7 @@ def transcribe_full_file(
     min_overlap_frac: float = MIN_ASSIGN_OVERLAP,
     rms_gate_db: float = RMS_GATE_DB,
     min_segment_sec: float = MIN_SEGMENT_SEC,
+    low_confidence_asr: float = LOW_CONFIDENCE_ASR,
 ) -> dict:
     """
     Transcribe the whole audio file with WhisperX, force-align to word level,
@@ -526,6 +574,13 @@ def transcribe_full_file(
         if seg.get("_hallucination_suspect"):
             n_suspect += 1
 
+    # ── Per-segment ASR confidence (Observation 4) ──
+    # Additive: mean word-alignment score per segment + a low-confidence flag,
+    # computed against the FINAL text (post gate/echo/hallucination handling).
+    conf_stats = aggregate_asr_confidence(
+        segments, low_confidence_threshold=low_confidence_asr
+    )
+
     print(f"  ✔ Segments with text     : {n_filled}/{len(segments)}")
     print(f"  ⚠ Low-confidence words   : {n_low_conf}")
     print(f"  ⚠ Words dropped (no-overlap/background): {n_dropped}")
@@ -533,6 +588,7 @@ def transcribe_full_file(
     print(f"  ⚠ Gated (too short)      : {gate_stats['gated_too_short']}")
     print(f"  ⚠ Prompt-echo filtered   : {n_echo}")
     print(f"  ⚠ Hallucination suspects : {n_suspect}")
+    print(f"  ⚠ Low-confidence ASR segs: {conf_stats['asr_low_confidence']}/{conf_stats['asr_scored']}")
 
     # ── Record contract metadata ──────────────────
     segments_data["source_language"] = detected_lang
@@ -552,11 +608,13 @@ def transcribe_full_file(
         "prompt_echo_filtered": n_echo,
         "hallucination_suspects": n_suspect,
         **gate_stats,
+        **conf_stats,
         "thresholds": {
             "min_align_score": min_align_score,
             "min_overlap_frac": min_overlap_frac,
             "rms_gate_db": rms_gate_db,
             "min_segment_sec": min_segment_sec,
+            "low_confidence_asr": low_confidence_asr,
         },
     }
 
@@ -663,6 +721,15 @@ def main() -> None:
         default=MIN_SEGMENT_SEC,
         help=f"Minimum segment duration in seconds; set 0 to disable  (default: {MIN_SEGMENT_SEC})",
     )
+    parser.add_argument(
+        "--low-confidence-asr",
+        type=float,
+        default=LOW_CONFIDENCE_ASR,
+        help=(
+            "Mean word-confidence below which a segment is flagged "
+            f"low_confidence_asr (advisory only, never dropped)  (default: {LOW_CONFIDENCE_ASR})"
+        ),
+    )
     args = parser.parse_args()
 
     # ── Validate inputs ──────────────────────
@@ -695,6 +762,7 @@ def main() -> None:
         min_overlap_frac=args.min_overlap_frac,
         rms_gate_db=args.rms_gate_db,
         min_segment_sec=args.min_segment_sec,
+        low_confidence_asr=args.low_confidence_asr,
     )
 
     # ── Step 4: Save output ──────────────────
