@@ -50,7 +50,7 @@ except Exception:
 # ── 0.4  Sync the project repo to the Colab VM (via Git) ────────────
 REPO_DIR = "/content/Dubly_ME"
 GIT_URL = "https://github.com/Omar-Gemy/Dubly_ME.git"
-BRANCH = "feature/architecture-refactor"
+BRANCH = "feature/upgrade-stack"
 
 if not os.path.exists(REPO_DIR):
     print(f"▶ Cloning repo from {GIT_URL} (branch: {BRANCH})...")
@@ -105,6 +105,66 @@ print(f"✔ ASR switchboard set: ASR_MODE = {ASR_MODE!r}")
 if ASR_MODE == "experimental":
     print(f"  experimental model: {EXPERIMENTAL_ASR_MODEL_PATH}")
     print("  ⚠ experimental = transcription only; Phase D still needs a legacy run.")
+
+
+# %% [Cell 0c] Model Conversion — Prepare Experimental ASR
+"""
+Build the experimental Egyptian CTranslate2 model IN-PLACE inside Colab.
+
+Idempotent — only builds what is missing:
+  1. CT2 model dir already exists      → skip (nothing to do).
+  2. Merged HF checkpoint missing      → run merge_lora.py (LoRA merge).
+  3. Merged exists but CT2 missing     → run ct2-transformers-converter.
+
+Only needed when you intend to run Phase C with ASR_MODE = "experimental".
+Safe to run in legacy mode too — it just reports "already present / skipping".
+"""
+import os, subprocess
+
+REPO_DIR = "/content/Dubly_ME"
+
+# CT2 dir that experimental mode loads (defined in the Cell 0b switchboard),
+# so we convert to exactly the path Phase C will read from.
+CT2_MODEL_DIR = EXPERIMENTAL_ASR_MODEL_PATH
+# merge_lora.py writes its merged HF checkpoint here (OUT is relative to its cwd).
+MERGED_DIR = f"{REPO_DIR}/whisper-large-v3-egy-merged"
+
+if os.path.isdir(CT2_MODEL_DIR):
+    print(f"✔ CT2 model already present — skipping conversion:\n    {CT2_MODEL_DIR}")
+else:
+    print(f"▶ CT2 model not found at:\n    {CT2_MODEL_DIR}\n  Building it now.")
+
+    # merge_lora.py needs peft (absent from requirements-colab.txt). ctranslate2's
+    # converter comes transitively with whisperx, so its version matches runtime.
+    print("▶ Ensuring conversion dep (peft) is installed…")
+    subprocess.run(["pip", "install", "-q", "peft"], check=True)
+
+    # ── Step 1: LoRA merge (only if the merged folder is missing) ──
+    if os.path.isdir(MERGED_DIR):
+        print(f"✔ Merged HF model already present — skipping merge:\n    {MERGED_DIR}")
+    else:
+        print("▶ Running merge_lora.py (LoRA merge → merged HF checkpoint)…")
+        subprocess.run(["python", f"{REPO_DIR}/merge_lora.py"], check=True, cwd=REPO_DIR)
+
+    # ── Step 2: CTranslate2 conversion ──
+    print(f"▶ Converting → CTranslate2:\n    {MERGED_DIR}\n    → {CT2_MODEL_DIR}")
+    os.makedirs(os.path.dirname(CT2_MODEL_DIR), exist_ok=True)
+    subprocess.run(
+        [
+            "ct2-transformers-converter",
+            "--model", MERGED_DIR,
+            "--output_dir", CT2_MODEL_DIR,
+            "--copy_files", "tokenizer.json", "preprocessor_config.json",
+            "--quantization", "float16",
+            "--force",
+        ],
+        check=True,
+    )
+    print(f"✔ Conversion complete — CT2 model ready at:\n    {CT2_MODEL_DIR}")
+
+print("\n" + "═" * 60)
+print("  ✅  Cell 0c: Model Conversion check complete")
+print("═" * 60)
 
 
 # %% [Cell 1] Phase A — Audio Ingestion & Voice Activity Detection
