@@ -122,7 +122,7 @@ def apply_torch_load_shim() -> bool:
     _original_load = torch.load
 
     def _patched_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        kwargs["weights_only"] = False
         return _original_load(*args, **kwargs)
 
     _patched_load._dubly_patched = True
