@@ -518,6 +518,84 @@ def intersect_and_split(
     return new_segments
 
 
+# ══════════════════════════════════════════════
+#  Step 5b — Re-join over-split fragments
+# ══════════════════════════════════════════════
+CONTIGUITY_TOLERANCE_SEC = 0.05   # fragments within this gap count as contiguous
+
+
+def rejoin_same_origin_fragments(segments: list[dict]) -> list[dict]:
+    """
+    Merge adjacent fragments that came from the SAME original VAD segment and
+    resolve to the SAME speaker — undoing over-splitting that would otherwise
+    sever one continuous utterance into independently-translated pieces.
+
+    Conservative by design (same-origin only):
+      - both fragments must carry the same non-null ``_original_segment_id``
+      - both must have the same ``speaker_id``
+      - they must be time-contiguous (gap ≤ CONTIGUITY_TOLERANCE_SEC)
+
+    Fragments without an ``_original_segment_id`` (i.e. never split) and
+    boundaries between different origins or speakers are left untouched. The
+    merged segment spans [first.start, last.end]; its ``_merged_from`` records
+    each contributing fragment's origin id and time range for later review.
+
+    NOTE: because Case 3 already coalesces consecutive same-speaker turns
+    within a split, this pass is primarily a safety net and fires rarely on
+    well-behaved diarization output.
+    """
+    if not segments:
+        return segments
+
+    merged: list[dict] = []
+    for seg in segments:
+        prev = merged[-1] if merged else None
+        origin = seg.get("_original_segment_id")
+
+        can_merge = (
+            prev is not None
+            and origin is not None
+            and prev.get("_original_segment_id") == origin
+            and prev.get("speaker_id") == seg.get("speaker_id")
+            and (seg["start_time"] - prev["end_time"]) <= CONTIGUITY_TOLERANCE_SEC
+        )
+
+        if not can_merge:
+            merged.append(dict(seg))
+            continue
+
+        # ── Merge seg into prev ────────────────────────────────
+        # Seed _merged_from with prev's own span on first merge.
+        if "_merged_from" not in prev:
+            prev["_merged_from"] = [{
+                "original_segment_id": prev.get("_original_segment_id"),
+                "start_time": prev["start_time"],
+                "end_time": prev["end_time"],
+            }]
+        prev["_merged_from"].append({
+            "original_segment_id": origin,
+            "start_time": seg["start_time"],
+            "end_time": seg["end_time"],
+        })
+
+        prev["end_time"] = seg["end_time"]
+        prev["duration"] = round(prev["end_time"] - prev["start_time"], 3)
+
+        # Preserve any transcribed text (usually None at Phase B).
+        prev_text = (prev.get("text") or "").strip()
+        seg_text = (seg.get("text") or "").strip()
+        if seg_text and seg_text != prev_text:
+            prev["text"] = (prev_text + " " + seg_text).strip() if prev_text else seg_text
+
+    n_rejoined = sum(1 for s in merged if "_merged_from" in s)
+    if n_rejoined:
+        log.info(
+            "Re-join pass: %d segment(s) → %d after merging %d over-split group(s)",
+            len(segments), len(merged), n_rejoined,
+        )
+    return merged
+
+
 def _merge_short_subsegments(
     turns: list[dict],
     min_duration: float,
@@ -657,6 +735,12 @@ def run_phase_b(
         min_sub_segment_sec=min_sub_segment_sec,
     )
 
+    # Re-join fragments over-split from the same original VAD segment onto the
+    # same speaker (prevents one utterance from being translated in pieces).
+    post_split_count = len(new_segments)
+    new_segments = rejoin_same_origin_fragments(new_segments)
+    rejoined_count = post_split_count - len(new_segments)
+
     # Renumber and update the data contract
     new_segments = renumber_segments(new_segments)
 
@@ -673,7 +757,8 @@ def run_phase_b(
     segments_data["diarization_stats"] = {
         "original_segment_count": original_count,
         "final_segment_count": len(new_segments),
-        "segments_split": len(new_segments) - original_count,
+        "segments_split": post_split_count - original_count,
+        "segments_rejoined": rejoined_count,
         "unique_speakers": len(unique_speakers),
         "speaker_labels": unique_speakers,
     }
