@@ -208,10 +208,18 @@ def load_diarization_pipeline(
     log.info("  (First run will download ~300 MB of model weights)")
 
     try:
-        pipeline = Pipeline.from_pretrained(
-            PYANNOTE_PIPELINE_ID,
-            token=hf_token,
-        )
+        try:
+            pipeline = Pipeline.from_pretrained(
+                PYANNOTE_PIPELINE_ID,
+                token=hf_token,
+            )
+        except TypeError:
+            # pyannote 3.1.1 (pinned transitively by whisperx) uses the
+            # older `use_auth_token` kwarg instead of `token` (pyannote 4.x).
+            pipeline = Pipeline.from_pretrained(
+                PYANNOTE_PIPELINE_ID,
+                use_auth_token=hf_token,
+            )
     except Exception as exc:
         # Common failure: token lacks access or licenses not accepted
         error_str = str(exc).lower()
