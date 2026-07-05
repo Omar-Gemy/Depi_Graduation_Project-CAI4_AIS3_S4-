@@ -38,6 +38,7 @@ def apply() -> bool:
         return False
 
     if hasattr(torchaudio, "AudioMetaData"):
+        apply_backend_shim()
         return False
 
     # The class still ships with torchaudio — only its public location moved
@@ -59,4 +60,38 @@ def apply() -> bool:
 
     torchaudio.AudioMetaData = audio_meta
     print("  [torchaudio_compat] patched torchaudio.AudioMetaData for pyannote 3.1.1")
+    apply_backend_shim()
     return True
+def apply_backend_shim() -> bool:
+    """
+    Ensure torchaudio.list_audio_backends / get_audio_backend / set_audio_backend
+    exist. pyannote 3.1.1's ``core/io.py`` calls ``list_audio_backends()`` at
+    import time (inside ``Audio.__init__``) to pick a default backend. Recent
+    torchaudio (TorchCodec-based) dropped this old backend-dispatch API.
+
+    Returns True if a patch was applied, False if already present or
+    torchaudio is unavailable.
+    """
+    try:
+        import torchaudio
+    except Exception:
+        return False
+
+    patched = False
+
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: ["soundfile"]
+        patched = True
+
+    if not hasattr(torchaudio, "get_audio_backend"):
+        torchaudio.get_audio_backend = lambda: "soundfile"
+        patched = True
+
+    if not hasattr(torchaudio, "set_audio_backend"):
+        torchaudio.set_audio_backend = lambda backend=None: None
+        patched = True
+
+    if patched:
+        print("  [torchaudio_compat] patched torchaudio.list_audio_backends for pyannote 3.1.1")
+
+    return patched
