@@ -77,6 +77,36 @@ print("  ✅  Cell 0: Environment Setup Complete")
 print("═" * 60)
 
 
+# %% [Cell 0b] ASR Switchboard — Legacy vs. Experimental (reversible)
+"""
+Toggle which ASR engine Phase C uses, WITHOUT touching the legacy path.
+
+  ASR_MODE = "legacy"        → existing WhisperX large-v3 + wav2vec2 forced
+                                alignment (writes artifacts/transcripts.json —
+                                required by Phase D).
+  ASR_MODE = "experimental"  → local Egyptian-fine-tuned CTranslate2 model via
+                                faster-whisper, TRANSCRIPTION ONLY (no forced
+                                alignment, no transcripts.json). Diagnostic
+                                output for manual comparison against legacy.
+
+Flip ASR_MODE back to "legacy" at any time to restore the full pipeline.
+"""
+ASR_MODE = "legacy"   # "legacy" | "experimental"
+
+# Local CTranslate2 model directory for experimental mode (the output of
+# merge_lora.py + ct2-transformers-converter). Kept on Drive so it survives
+# across Colab sessions; change to any local path if you prefer.
+EXPERIMENTAL_ASR_MODEL_PATH = "/content/drive/MyDrive/Dubly_ME_Storage/models/whisper-large-v3-egy-ct2"
+EXPERIMENTAL_ASR_LANGUAGE = "ar"
+EXPERIMENTAL_ASR_DEVICE = "cuda"
+EXPERIMENTAL_ASR_COMPUTE_TYPE = "float16"
+
+print(f"✔ ASR switchboard set: ASR_MODE = {ASR_MODE!r}")
+if ASR_MODE == "experimental":
+    print(f"  experimental model: {EXPERIMENTAL_ASR_MODEL_PATH}")
+    print("  ⚠ experimental = transcription only; Phase D still needs a legacy run.")
+
+
 # %% [Cell 1] Phase A — Audio Ingestion & Voice Activity Detection
 """
 Extract audio from the source media file, normalise loudness (EBU R128),
@@ -155,22 +185,90 @@ Script:   src/asr_transcription.py
 Input:    data/audio_out/_temp_normalised.wav  +  artifacts/segments.json
 Output:   artifacts/transcripts.json
 """
-import subprocess
+import subprocess, os
 
 REPO_DIR = "/content/Dubly_ME"
 
-print("▶ Phase C: ASR Transcription")
-subprocess.run(
-    [
-        "python", f"{REPO_DIR}/src/asr_transcription.py",
-        "--model", "large-v3",
-        "--source-lang", "ar",
-        "--device", "cuda",
-        "--compute-type", "float16",
-    ],
-    check=True,
-    cwd=REPO_DIR,
-)
+
+def run_experimental_asr(
+    model_path,
+    audio_path,
+    language="ar",
+    device="cuda",
+    compute_type="float16",
+    beam_size=5,
+):
+    """
+    [EXPERIMENTAL] Transcribe the normalised WAV directly with a local
+    CTranslate2 model (Egyptian fine-tune) via faster-whisper.
+
+    Transcription ONLY — no wav2vec2 forced alignment and no diarization
+    intersection, so this does NOT write artifacts/transcripts.json. It prints
+    the transcript for manual comparison against the legacy WhisperX output;
+    Phase D still requires a legacy ASR run to produce its input contract.
+    """
+    from faster_whisper import WhisperModel
+
+    # CTranslate2 has no fp16 CPU kernels — mirror src/asr_transcription.py.
+    if device == "cpu" and compute_type == "float16":
+        compute_type = "int8"
+        print("  ⚠ float16 unsupported on CPU — using int8 compute type")
+
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(
+            f"Experimental CT2 model dir not found: {model_path}\n"
+            f"Run merge_lora.py + ct2-transformers-converter first, or point "
+            f"EXPERIMENTAL_ASR_MODEL_PATH at the converted model directory."
+        )
+
+    print(f"▶ [experimental] Loading CT2 model: {model_path}")
+    print(f"  device={device}  compute_type={compute_type}")
+    model = WhisperModel(model_path, device=device, compute_type=compute_type)
+
+    print("▶ [experimental] Transcribing (transcription only, NO alignment)…")
+    segments, info = model.transcribe(audio_path, language=language, beam_size=beam_size)
+
+    print(f"  language: {info.language}")
+    print("═" * 60)
+    for seg in segments:
+        print(f"[{seg.start:7.2f}s → {seg.end:7.2f}s]  {seg.text.strip()}")
+    print("═" * 60)
+    print("  ⚠ Diagnostic only — no transcripts.json written.")
+    print("    Set ASR_MODE = 'legacy' to produce the Phase D contract.")
+
+
+print(f"▶ Phase C: ASR Transcription  [ASR_MODE = {ASR_MODE}]")
+
+if ASR_MODE == "legacy":
+    # ── LEGACY PATH (unchanged): WhisperX large-v3 + wav2vec2 forced alignment ──
+    print("▶ Phase C: ASR Transcription")
+    subprocess.run(
+        [
+            "python", f"{REPO_DIR}/src/asr_transcription.py",
+            "--model", "large-v3",
+            "--source-lang", "ar",
+            "--device", "cuda",
+            "--compute-type", "float16",
+        ],
+        check=True,
+        cwd=REPO_DIR,
+    )
+
+elif ASR_MODE == "experimental":
+    # ── EXPERIMENTAL PATH: local Egyptian CT2 model, transcription only ──
+    run_experimental_asr(
+        model_path=EXPERIMENTAL_ASR_MODEL_PATH,
+        audio_path=f"{REPO_DIR}/data/audio_out/_temp_normalised.wav",
+        language=EXPERIMENTAL_ASR_LANGUAGE,
+        device=EXPERIMENTAL_ASR_DEVICE,
+        compute_type=EXPERIMENTAL_ASR_COMPUTE_TYPE,
+    )
+
+else:
+    raise ValueError(
+        f"Unknown ASR_MODE={ASR_MODE!r} — set 'legacy' or 'experimental' "
+        f"in the [Cell 0b] switchboard."
+    )
 
 print("\n" + "═" * 60)
 print("  ✅  Phase C: ASR Transcription Complete")
