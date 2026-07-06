@@ -390,6 +390,18 @@ def render_final_video(
 # ──────────────────────────────────────────────
 #  Save mix manifest
 # ──────────────────────────────────────────────
+def _rel_or_abs(path: Path) -> str:
+    """
+    Return the path relative to PROJECT_ROOT when it lives inside the repo,
+    otherwise fall back to the absolute path. The source video may sit outside
+    the repo (e.g. on Google Drive), where relative_to() would raise.
+    """
+    try:
+        return str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path).replace("\\", "/")
+
+
 def save_mix_manifest(
     placement_log: list[dict],
     output_audio: Path,
@@ -408,9 +420,7 @@ def save_mix_manifest(
         "phase": "F",
         "step": "mix-render",
         "description": "Final audio mix and video render",
-        "source_video": str(
-            source_video.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
+        "source_video": _rel_or_abs(source_video),
         "audio_codec": f"AAC {AAC_BITRATE}",
         "sample_rate": SAMPLE_RATE,
         "crossfade_ms": CROSSFADE_MS,
