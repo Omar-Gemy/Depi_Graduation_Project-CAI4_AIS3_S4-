@@ -61,6 +61,14 @@ XTTS_MODEL_NAME    = "tts_models/multilingual/multi-dataset/xtts_v2"
 SAMPLE_RATE        = 22050     # XTTS v2 native sample rate
 CACHE_FLUSH_EVERY  = 5        # flush CUDA cache every N segments
 
+# XTTS v2's 17 built-in languages. The synthesis language is resolved from
+# translation.json's `target_language` (or --target-lang), NOT hardcoded —
+# so ar/en/es (and the rest) all work with no code change.
+XTTS_SUPPORTED_LANGS = {
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+    "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
+}
+
 # Fallback reference extraction window (only used if voice_ref.wav
 # is missing and --auto-extract is enabled)
 FALLBACK_REF_START = 2.5      # seconds — start of segment #1
@@ -223,6 +231,7 @@ def synthesize_segments(
     segments: list[dict],
     ref_audio_path: Path,
     output_dir: Path,
+    language: str,
 ) -> list[dict]:
     """
     Iterate over translated segments from translation.json,
@@ -296,7 +305,7 @@ def synthesize_segments(
                     text=text,
                     file_path=str(out_path),
                     speaker_wav=ref_wav_str,
-                    language="en",
+                    language=language,
                 )
 
             # Verify the output file was actually created
@@ -471,6 +480,12 @@ def main() -> None:
         choices=["auto", "cuda", "cpu"],
         help="Device: 'auto', 'cpu', or 'cuda'  (default: auto)",
     )
+    parser.add_argument(
+        "--target-lang",
+        default=None,
+        help="XTTS dub language tag (ar/en/es/...). "
+             "Default: target_language from translation.json, else 'en'.",
+    )
     args = parser.parse_args()
 
     print()
@@ -496,6 +511,16 @@ def main() -> None:
     with open(args.input, "r", encoding="utf-8") as fh:
         translation_data = json.load(fh)
 
+    # Resolve the synthesis language: CLI override → translation.json → "en".
+    tts_language = (
+        args.target_lang or translation_data.get("target_language") or "en"
+    ).strip().lower()
+    if tts_language not in XTTS_SUPPORTED_LANGS:
+        print(f"  ✖ Unsupported TTS language '{tts_language}'. "
+              f"XTTS v2 supports: {', '.join(sorted(XTTS_SUPPORTED_LANGS))}")
+        sys.exit(1)
+    print(f"  Target TTS language : {tts_language}")
+
     segments = translation_data["segments"]
     total_segs = len(segments)
     valid_segs = sum(
@@ -514,6 +539,7 @@ def main() -> None:
         segments=segments,
         ref_audio_path=ref_audio,
         output_dir=AUDIO_OUT_DIR,
+        language=tts_language,
     )
 
     # ── Step 4: Save manifest ───────────────────

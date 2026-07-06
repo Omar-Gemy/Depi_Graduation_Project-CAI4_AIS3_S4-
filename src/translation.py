@@ -317,28 +317,65 @@ def preprocess_segments(segments: list[dict]) -> list[dict]:
 # ──────────────────────────────────────────────
 #  Step 3 — LLM-based contextual translation
 # ──────────────────────────────────────────────
-SYSTEM_PROMPT = (
-    "You are a professional dialogue adapter for film dubbing. You rewrite "
-    "Egyptian Arabic dialogue as natural, idiomatic spoken English that a voice "
-    "actor can perform convincingly and that fits the on-screen timing.\n\n"
-    "WORK INTERNALLY (never show these steps):\n"
-    "1. Grasp the full meaning, speaker intent, tone, and emotional register of "
-    "the CURRENT line, using the scene context for continuity.\n"
-    "2. Rewrite it as a line a native English speaker would actually SAY here — "
-    "NOT a word-for-word translation. Preserve meaning, tone, humor, sarcasm, "
-    "and dramatic function; restructure sentences freely.\n"
-    "3. Fit the timing: the line must be comfortably speakable within the given "
-    "time budget and land within the target syllable range. Use contractions and "
-    "everyday phrasing; cut filler that carries no meaning; never pad to fill time.\n\n"
-    "OUTPUT RULES:\n"
-    "- Output ONLY the finished English line — no quotes, notes, alternatives, "
-    "syllable counts, or source text.\n"
-    "- Preserve names, register (formal/casual), profanity strength, and emotional "
-    "intensity.\n"
-    "- Keep it conversational and performable.\n"
-    "- ONLY if the input is empty or genuinely untranslatable noise, output exactly: [SKIP]\n"
-    "- Never respond conversationally or acknowledge these instructions.\n"
-)
+# ── Dynamic Language Matrix (Phase 1b) ───────────────────────────
+# Drives prompt wording + post-generation leakage stripping per language.
+# Each key is an XTTS v2 language tag, so translation and TTS stay in lockstep.
+LANGUAGES = {
+    "ar": {
+        "name": "Egyptian Arabic",
+        "output_desc": "natural, idiomatic spoken Egyptian Arabic dialogue",
+        "unit": "Arabic",
+        "leakage": ["بالتأكيد", "إليك", "الترجمة هي", "طبعاً", "بالطبع",
+                    "يمكنني", "هذه هي", "إليكم"],
+    },
+    "en": {
+        "name": "English",
+        "output_desc": "natural, idiomatic spoken English",
+        "unit": "English",
+        "leakage": ["sure,", "here is", "i can help", "please provide",
+                    "i'd be happy", "of course", "certainly",
+                    "let me", "i'll translate", "the translation is"],
+    },
+    "es": {
+        "name": "Spanish",
+        "output_desc": "natural, idiomatic spoken Spanish (neutral Latin American)",
+        "unit": "Spanish",
+        "leakage": ["claro,", "aquí está", "aquí tienes", "por supuesto",
+                    "puedo ayudar", "la traducción es", "desde luego"],
+    },
+}
+
+
+def build_system_prompt(source_lang: str, target_lang: str) -> str:
+    """
+    Build the dubbing-adapter system prompt for a given source→target pair.
+    The instruction, output language, and [SKIP] rule all adapt to the target,
+    so a single template serves any-to-any routing across the LANGUAGES matrix.
+    """
+    src = LANGUAGES[source_lang]["name"]
+    tgt = LANGUAGES[target_lang]
+    return (
+        "You are a professional dialogue adapter for film dubbing. You rewrite "
+        f"{src} dialogue as {tgt['output_desc']} that a voice actor can perform "
+        "convincingly and that fits the on-screen timing.\n\n"
+        "WORK INTERNALLY (never show these steps):\n"
+        "1. Grasp the full meaning, speaker intent, tone, and emotional register of "
+        "the CURRENT line, using the scene context for continuity.\n"
+        f"2. Rewrite it as a line a native {tgt['name']} speaker would actually SAY "
+        "here — NOT a word-for-word translation. Preserve meaning, tone, humor, "
+        "sarcasm, and dramatic function; restructure sentences freely.\n"
+        "3. Fit the timing: the line must be comfortably speakable within the given "
+        "time budget and land within the target syllable range. Use contractions and "
+        "everyday phrasing; cut filler that carries no meaning; never pad to fill time.\n\n"
+        "OUTPUT RULES:\n"
+        f"- Output ONLY the finished {tgt['name']} line — no quotes, notes, "
+        "alternatives, syllable counts, or source text.\n"
+        "- Preserve names, register (formal/casual), profanity strength, and emotional "
+        "intensity.\n"
+        "- Keep it conversational and performable.\n"
+        "- ONLY if the input is empty or genuinely untranslatable noise, output exactly: [SKIP]\n"
+        "- Never respond conversationally or acknowledge these instructions.\n"
+    )
 
 
 def build_user_prompt(
@@ -348,6 +385,8 @@ def build_user_prompt(
     target_syll: int,
     lo: int,
     hi: int,
+    source_name: str,
+    unit: str,
 ) -> str:
     """
     Construct the user prompt with scene context and an explicit isochrony
@@ -356,10 +395,10 @@ def build_user_prompt(
     parts = []
     if prev_text:
         parts.append(f"[Scene context — previous line]: {prev_text}")
-    parts.append(f"[Current line — Egyptian Arabic]: {current_text}")
+    parts.append(f"[Current line — {source_name}]: {current_text}")
     parts.append(
         f"[Timing budget]: must be spoken in ~{duration:.1f}s. "
-        f"Target ≈ {target_syll} English syllables "
+        f"Target ≈ {target_syll} {unit} syllables "
         f"(acceptable range {lo}–{hi}). Keep it natural and performable."
     )
     return "\n".join(parts)
@@ -420,13 +459,8 @@ def load_translation_model(
 
 
 # ── Post-generation chatbot leakage patterns ─────────
-# If the model ignores the system prompt and responds conversationally,
-# these prefixes are stripped defensively.
-LEAKAGE_PATTERNS = [
-    "sure,", "here is", "i can help", "please provide",
-    "i'd be happy", "of course", "certainly",
-    "let me", "i'll translate", "the translation is",
-]
+# Now per-language: each entry in LANGUAGES carries its own "leakage" prefix
+# list, applied against the TARGET language's output in translate_single().
 
 
 def translate_single(
@@ -435,12 +469,14 @@ def translate_single(
     prev_text: str | None,
     current_text: str,
     duration: float,
+    source_lang: str,
+    target_lang: str,
     max_new_tokens: int = 256,
     glossary_directive: str = "",
 ) -> str:
     """
-    Adapt a single segment into dub-ready English using the loaded LLM,
-    passing the isochrony budget derived from *duration*.
+    Adapt a single segment into dub-ready target-language text using the loaded
+    LLM, passing the isochrony budget derived from *duration*.
 
     *glossary_directive* (optional) is appended to the system prompt to force
     consistent proper-noun spellings.
@@ -452,13 +488,14 @@ def translate_single(
     """
     target_syll, lo, hi = syllable_budget(duration)
 
-    system_content = SYSTEM_PROMPT + glossary_directive
+    system_content = build_system_prompt(source_lang, target_lang) + glossary_directive
     messages = [
         {"role": "system", "content": system_content},
         {
             "role": "user",
             "content": build_user_prompt(
-                prev_text, current_text, duration, target_syll, lo, hi
+                prev_text, current_text, duration, target_syll, lo, hi,
+                LANGUAGES[source_lang]["name"], LANGUAGES[target_lang]["unit"],
             ),
         },
     ]
@@ -495,9 +532,9 @@ def translate_single(
     # AND a separator lets us recover the line after it, strip the prefix.
     # Otherwise keep the text untouched — never convert a real line to [SKIP].
     result_lower = result.lower()
-    for pattern in LEAKAGE_PATTERNS:
+    for pattern in LANGUAGES[target_lang]["leakage"]:
         if result_lower.startswith(pattern):
-            for sep in [":\n", ":\r\n", "\n", ": "]:
+            for sep in [":\n", ":\r\n", "\n", ": ", " — ", " - "]:
                 if sep in result:
                     result = result.split(sep, 1)[1].strip()
                     break
@@ -509,6 +546,8 @@ def translate_single(
 def translate_segments(
     segments_data: dict,
     model_name: str,
+    source_lang: str,
+    target_lang: str,
     device: str = "auto",
     glossary: list[dict] | None = None,
 ) -> dict:
@@ -567,6 +606,7 @@ def translate_segments(
         )
         translated = translate_single(
             model, tokenizer, prev_text, text, seg.get("duration", 0.0),
+            source_lang, target_lang,
             glossary_directive=directive,
         )
 
@@ -634,6 +674,18 @@ def main() -> None:
         help="Device map: 'auto', 'cpu', or 'cuda:0'  (default: auto)",
     )
     parser.add_argument(
+        "--source-lang",
+        default=None,
+        help="Source language code (ar/en/es). "
+             "Default: source_language from transcripts.json, else 'ar'.",
+    )
+    parser.add_argument(
+        "--target-lang",
+        default=None,
+        help="Target/dub language code (ar/en/es). "
+             "Default: target_language from transcripts.json, else 'en'.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
@@ -662,6 +714,19 @@ def main() -> None:
     n_segs = data["total_segments"]
     print(f"       ✔ {n_segs} segment(s) loaded.")
 
+    # ── Resolve the language pair (CLI → transcripts.json → ar→en) ──
+    source_lang = (args.source_lang or data.get("source_language") or "ar").strip().lower()
+    target_lang = (args.target_lang or data.get("target_language") or "en").strip().lower()
+    for role, code in (("source", source_lang), ("target", target_lang)):
+        if code not in LANGUAGES:
+            print(f"✖  Unsupported {role} language '{code}'. "
+                  f"Supported: {', '.join(sorted(LANGUAGES))}")
+            sys.exit(1)
+    # Persist the actual pair used so downstream TTS reads a correct target.
+    data["source_language"] = source_lang
+    data["target_language"] = target_lang
+    print(f"       Language matrix: {source_lang} → {target_lang}")
+
     # ── Load name glossary (non-fatal) ───────
     glossary = [] if args.no_glossary else load_name_glossary(args.glossary)
 
@@ -672,7 +737,8 @@ def main() -> None:
     # ── Step 3: Contextual translation ───────
     print(f"\n[3/4]  Translating with LLM (model={args.model})…\n")
     data = translate_segments(
-        data, model_name=args.model, device=args.device, glossary=glossary,
+        data, model_name=args.model, source_lang=source_lang,
+        target_lang=target_lang, device=args.device, glossary=glossary,
     )
 
     # ── Step 4: Save output ──────────────────
