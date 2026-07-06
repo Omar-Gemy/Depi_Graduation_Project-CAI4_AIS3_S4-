@@ -75,42 +75,78 @@ Every script accepts `--input`/`--output`/path overrides and defaults to the `ar
 - Stage scripts use `PROJECT_ROOT = Path(__file__).resolve().parent.parent`-relative paths; run them from anywhere but keep the `src/ … artifacts/ … data/` layout intact.
 - User-facing console output uses ✔/✖/▶/✅ status glyphs and `[n/N]` step counters — match this style when adding stage output.
 
-## Current Session State (2026-07-05) — QA remediation on feature/architecture-refactor
+## Current Session State (2026-07-06) — Handoff: Phase E/F integration, pivot to Arabic-out
 
-A QA pass over a real 53-segment translation.json test run found 4 issues.
-Status:
+**Branch:** `feature/upgrade-stack` (all recent work is here, NOT `feature/architecture-refactor`).
 
-- ✅ **Observation 1** (commit `e866115`): fixed `detect_whisper_loop` false-positives
-  in `src/translation.py` — was dropping ~19% of valid segments as false "loops".
-  Now token-based, punctuation-normalized, decoupled advisory-flag-vs-hard-skip.
-- ✅ **Observation 2** (commit `482e31b`): added `config/name_glossary.json` +
-  injection into the translation prompt in `src/translation.py`, for stable
-  character-name transliteration.
-- ✅ **Observation 3 Part A** (commit `424dd18`): raised the diarization
-  split threshold in `src/diarization.py` (`SPLIT_MIN_SECONDARY_FRAC=0.25`,
-  `SPLIT_MIN_SECONDARY_SEC=0.7`) to stop spurious speaker-change splits.
-- ✅ **Observation 3 Part B** (just committed — confirm commit hash with
-  `git log -1 --oneline`): added `rejoin_same_origin_fragments()` in
-  `src/diarization.py` — merges adjacent same-origin/same-speaker fragments
-  post-split, with a `_merged_from` provenance field and a new
-  `segments_rejoined` stat in `diarization_stats`.
+### Current status — what works
+- **Phases A, B, C, D are verified and working** end-to-end in
+  `notebooks/colab_pipeline_(Colab).ipynb` on Colab (GPU):
+  A = ingestion/VAD, B = diarization, C = ASR (WhisperX large-v3), D = translation
+  (Qwen2.5-14B-Instruct-AWQ). Each phase is a `src/*.py` CLI stage the notebook
+  invokes via `subprocess`, emitting its JSON contract into `artifacts/`.
+- ASR confidence surfacing (`asr_confidence` / `low_confidence_asr`) is committed
+  in `src/asr_transcription.py` (commit `5e1ffee`). NOTE: the committed
+  `artifacts/*.json` are pre-fix runs, so those fields read null there — a fresh
+  GPU run is needed to populate real numbers.
 
-### All 4 observations complete (as of 2026-07-05)
-All committed on feature/architecture-refactor. Next real milestone: run the
-full pipeline end-to-end on Colab (GPU) to get real asr_confidence numbers
-(the current transcripts.json fixture has no persisted word-scores) and
-validate all 4 fixes against actual audio.
+### THE BLOCKING DECISION — direction pivot (Arabic Video Out)
+- The pipeline **currently outputs ENGLISH dubbing**: `translation.json` is
+  `source_language: ar → target_language: en`, and `translated_text` is English
+  (e.g. "You busy with the laundry now?"). Phase E (`src/tts_synthesis.py`)
+  synthesizes **English** from that field.
+- **The objective is Arabic Video Out** (Arabic source video → Arabic dubbed
+  video). This is a direction change that must be resolved in Phase D BEFORE
+  Phase E/F can produce Arabic audio. The current artifact cannot produce Arabic
+  speech — its text is English.
 
-Surface ASR confidence in `src/asr_transcription.py`:
-- Add `asr_confidence` (aggregated from faster-whisper/whisperx's existing
-  word-level alignment scores) and a `low_confidence_asr` flag to the
-  `transcripts.json` output.
-- Additive only — do not change existing fields or the output path.
+### Required actions for next session (in order)
+1. **Revisit Phase D (Translation) → make it output Arabic.** Change the target so
+   the dubbed text is Arabic (AR→AR: an *isochronous Arabic rewrite/adaptation*
+   that fits each segment's timing budget, NOT a literal copy of the source
+   `text`). Touch points in `src/translation.py`: `SYSTEM_PROMPT`,
+   `build_user_prompt`, and `config/language_registry.json` (target language).
+   Re-run Phase D to regenerate `translation.json` with Arabic `translated_text`.
+2. **Implement Phase E (TTS) in the notebook.** IMPORTANT: the stage script
+   **already exists** — `src/tts_synthesis.py` (XTTS v2 via Coqui, self-hosted).
+   XTTS v2 supports Arabic, so the engine does not change. Add a notebook cell
+   that `subprocess`-calls it (same pattern as Phases A–D); do NOT write new
+   inline TTS code. Needs `artifacts/voice_ref.wav` (speaker reference).
+3. **Implement Phase F (Video Muxing) in the notebook.** Also **already exists** as
+   scripts: `src/time_stretch.py` (WSOLA duration-fit → `stretch_manifest.json`),
+   `src/mix_render.py` (mix + mux over source video → `final_dubbed.mp4`),
+   `src/qa_report.py` (QA). Add notebook cells that `subprocess`-call these; no
+   `moviepy` needed — `mix_render.py` muxes via FFmpeg directly.
 
-### Standing process rules for this remediation work
-- One fix per commit. Show the full diff and wait for explicit "approved"
-  before moving to the next task.
-- Never run git yourself (add/commit/push) — the human handles this after
-  reviewing each diff.
+### Hard constraints to respect during E/F (do not violate)
+- **Zero third-party/cloud APIs** (rule #1). `edge-tts` is a Microsoft cloud
+  endpoint and is **banned** — use the self-hosted **XTTS v2** already wired in
+  `src/tts_synthesis.py`.
+- **Reuse the existing `src/` stages**, don't reinvent them inline — the modular
+  CLI-stage + JSON-contract design is a hard architectural rule.
+- New TTS/video deps must be pinned/isolated to avoid conflicting with the
+  pinned `whisperx==3.3.1` / `transformers==4.47.1` / `autoawq==0.2.8` set.
+
+### Environment-agnostic refactor (this session, feature/upgrade-stack) — UNCOMMITTED
+Created/edited but NOT yet committed (human commits explicitly, one concern per
+commit). These make the pipeline runnable off Colab (RunPod/local):
+- `setup_env.sh` (new) — staged, failure-tolerant dependency installer
+  (PyTorch → core → whisperx `--no-deps` → autoawq last). Replaces rigid
+  `requirements-colab.txt` install.
+- `convert_to_ct2.py` (new) — programmatic HF→CTranslate2 conversion (fixes the
+  CLI's `dtype` TypeError / `Fast download` ValueError).
+- `merge_lora.py`, `eval_model.py` (new) — Egyptian-ASR experiment tooling
+  (LoRA merge + standalone CT2 spot-check). Experimental ASR is opt-in only.
+- `notebooks/colab_pipeline.py` + `notebooks/colab_pipeline.ipynb` (edited) —
+  env auto-detection (`IN_COLAB`, `STORAGE_ROOT` = `DUBLY_STORAGE_ROOT` env →
+  `/workspace` → `<repo>/storage`, `REPO_DIR` auto-detect), no Drive mount,
+  ASR legacy/experimental switchboard. **NOTE:** the file the user runs on Colab
+  is `colab_pipeline_(Colab).ipynb`, which is a SEPARATE copy still on the old
+  `/content` Cell 0 — reconcile the two notebooks next session.
+
+### Standing process rules (unchanged)
+- One fix per commit. Show the full diff and wait for explicit "approved" before
+  moving on.
+- Never run git yourself (add/commit/push) — the human handles this after review.
 - No `git add .` — explicit files only.
 - Don't touch files outside the current task's stated scope.
