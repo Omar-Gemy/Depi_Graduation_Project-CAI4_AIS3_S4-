@@ -69,6 +69,11 @@ XTTS_SUPPORTED_LANGS = {
     "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
 }
 
+# Phase 2 — multi-speaker voice references.
+SPEAKER_UNKNOWN_LABEL = "SPEAKER_UNKNOWN"   # diarization catch-all bucket
+MIN_SPEAKER_REF_SEC   = 3.0                 # min clean audio for a dedicated clone
+MAX_SPEAKER_REF_SEC   = 8.0                 # cap the extracted reference window
+
 # Fallback reference extraction window (only used if voice_ref.wav
 # is missing and --auto-extract is enabled)
 FALLBACK_REF_START = 2.5      # seconds — start of segment #1
@@ -167,6 +172,94 @@ def _extract_reference_clip(
 
 
 # ──────────────────────────────────────────────
+#  Step 1b — Build per-speaker reference map
+# ──────────────────────────────────────────────
+def _find_profile_file(profiles_dir: Path, speaker_id: str):
+    """Return a hand-picked profile clip for this speaker, if one exists."""
+    for ext in (".wav", ".flac", ".mp3", ".m4a"):
+        cand = profiles_dir / f"{speaker_id}{ext}"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _best_ref_segment(segments: list[dict], speaker_id: str):
+    """Longest clean (non-skipped) segment for this speaker, ≥ MIN_SPEAKER_REF_SEC."""
+    cands = [
+        s for s in segments
+        if s.get("speaker_id") == speaker_id
+        and not s.get("skip_translation", False)
+        and (s.get("duration") or 0.0) >= MIN_SPEAKER_REF_SEC
+    ]
+    return max(cands, key=lambda s: s.get("duration") or 0.0) if cands else None
+
+
+def build_speaker_ref_map(
+    segments: list[dict],
+    source_video: Path,
+    profiles_dir: Path,
+    global_ref: Path,
+    auto_extract: bool,
+    cache_dir: Path,
+) -> dict:
+    """
+    Map each distinct speaker_id → a dedicated voice reference WAV.
+
+    Resolution per speaker (best → fallback):
+      1. Explicit profile  profiles_dir/<speaker_id>.{wav,flac,mp3,m4a}
+      2. Auto-extracted longest clean segment → cache_dir/<speaker_id>.wav
+      3. (implicit) no entry → caller uses the global reference
+
+    SPEAKER_UNKNOWN is never given a dedicated voice (audit #6): it is a
+    catch-all bucket that may mix speakers, so it routes to the global
+    reference. Returns {speaker_id: Path} — speakers absent from the dict
+    fall back to global_ref at the call site.
+    """
+    speaker_ids = sorted({s.get("speaker_id") for s in segments if s.get("speaker_id")})
+    ref_map: dict = {}
+    print(f"  Speakers present : {len(speaker_ids)}  "
+          f"({', '.join(speaker_ids) or 'none'})")
+
+    for sid in speaker_ids:
+        # 1. Hand-picked profile
+        prof = _find_profile_file(profiles_dir, sid)
+        if prof is not None:
+            ref_map[sid] = prof
+            print(f"    {sid:<16} → profile  {prof.name}")
+            continue
+
+        # SPEAKER_UNKNOWN → global, never a dedicated clone
+        if sid == SPEAKER_UNKNOWN_LABEL:
+            print(f"    {sid:<16} → global   (unknown bucket → shared voice)")
+            continue
+
+        # 2. Auto-extract the longest clean segment for this speaker
+        if auto_extract and source_video.is_file():
+            best = _best_ref_segment(segments, sid)
+            if best is not None:
+                start = best["start_time"]
+                end = start + min(best.get("duration", 0.0), MAX_SPEAKER_REF_SEC)
+                out = cache_dir / f"{sid}.wav"
+                try:
+                    if not out.is_file():
+                        _extract_reference_clip(source_video, out, start, end)
+                    ref_map[sid] = out
+                    print(f"    {sid:<16} → extract  {out.name} "
+                          f"({end - start:.1f}s @ {start:.1f}s)")
+                    continue
+                except SystemExit:
+                    # _extract_reference_clip exits on FFmpeg failure; downgrade
+                    # to a soft fallback rather than killing the whole run.
+                    print(f"    {sid:<16} → global   (extraction failed)")
+                    continue
+
+        # 3. Fallback to global reference
+        print(f"    {sid:<16} → global   (no profile / no clean ref segment)")
+
+    return ref_map
+
+
+# ──────────────────────────────────────────────
 #  Step 2 — Load XTTS v2 model
 # ──────────────────────────────────────────────
 def load_tts_model(device: str = "auto"):
@@ -229,7 +322,8 @@ def synthesize_segments(
     tts,
     device: str,
     segments: list[dict],
-    ref_audio_path: Path,
+    speaker_ref_map: dict,
+    global_ref: Path,
     output_dir: Path,
     language: str,
 ) -> list[dict]:
@@ -257,7 +351,6 @@ def synthesize_segments(
     synthesized_count = 0
     skipped_count = 0
     failed_count = 0
-    ref_wav_str = str(ref_audio_path)
 
     t_start_all = time.perf_counter()
 
@@ -282,6 +375,7 @@ def synthesize_segments(
             manifest.append({
                 "segment_id": seg_id,
                 "status": "skipped",
+                "speaker_id": seg.get("speaker_id"),
                 "reason": reason_str,
                 "output_file": None,
                 "duration_s": None,
@@ -291,6 +385,13 @@ def synthesize_segments(
             continue
 
         # ── Synthesize this segment ─────────────
+        speaker_id = seg.get("speaker_id")
+        ref_path = speaker_ref_map.get(speaker_id, global_ref)
+        try:
+            ref_rel = str(ref_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        except ValueError:
+            ref_rel = str(ref_path)
+
         out_filename = f"segment_{seg_id:03d}.wav"
         out_path = output_dir / out_filename
 
@@ -304,7 +405,7 @@ def synthesize_segments(
                 tts.tts_to_file(
                     text=text,
                     file_path=str(out_path),
-                    speaker_wav=ref_wav_str,
+                    speaker_wav=str(ref_path),
                     language=language,
                 )
 
@@ -320,6 +421,8 @@ def synthesize_segments(
             manifest.append({
                 "segment_id": seg_id,
                 "status": "success",
+                "speaker_id": speaker_id,
+                "reference_audio": ref_rel,
                 "output_file": str(
                     out_path.relative_to(PROJECT_ROOT)
                 ).replace("\\", "/"),
@@ -339,6 +442,7 @@ def synthesize_segments(
             manifest.append({
                 "segment_id": seg_id,
                 "status": "error",
+                "speaker_id": speaker_id,
                 "error": str(e),
                 "output_file": None,
                 "duration_s": None,
@@ -373,6 +477,7 @@ def synthesize_segments(
 def save_manifest(
     manifest: list[dict],
     ref_audio_path: Path,
+    speaker_ref_map: dict,
     output_path: Path,
     model_name: str,
 ) -> None:
@@ -380,15 +485,21 @@ def save_manifest(
     Save the TTS run manifest as a JSON data contract.
 
     This mirrors the convention from Phase D's translation.json:
-    a top-level dict with metadata + a segments array.
+    a top-level dict with metadata + a segments array. The speaker_profiles
+    map records which reference clip cloned each speaker (Phase 2).
     """
+    def _rel(p) -> str:
+        try:
+            return str(Path(p).relative_to(PROJECT_ROOT)).replace("\\", "/")
+        except ValueError:
+            return str(p)
+
     data = {
         "phase": "E",
         "description": "Voice Cloning & TTS Synthesis",
         "tts_model": model_name,
-        "reference_audio": str(
-            ref_audio_path.relative_to(PROJECT_ROOT)
-        ).replace("\\", "/"),
+        "reference_audio": _rel(ref_audio_path),
+        "speaker_profiles": {sid: _rel(p) for sid, p in speaker_ref_map.items()},
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_segments": len(manifest),
         "synthesized": sum(1 for m in manifest if m["status"] == "success"),
@@ -486,6 +597,17 @@ def main() -> None:
         help="XTTS dub language tag (ar/en/es/...). "
              "Default: target_language from translation.json, else 'en'.",
     )
+    parser.add_argument(
+        "--speaker-profiles-dir",
+        default=str(VOICE_PROFILES),
+        help="Dir of hand-picked per-speaker reference clips "
+             "(<speaker_id>.wav). Default: voice_profiles/",
+    )
+    parser.add_argument(
+        "--single-voice",
+        action="store_true",
+        help="Force one shared voice for all speakers (pre-Phase-2 behavior).",
+    )
     args = parser.parse_args()
 
     print()
@@ -533,11 +655,28 @@ def main() -> None:
     print(f"  To skip         : {total_segs - valid_segs}")
     print()
 
+    # ── Resolve per-speaker voice references (Phase 2) ──
+    if args.single_voice:
+        print("  Voice mode      : single (--single-voice)")
+        speaker_ref_map = {}
+    else:
+        print("  Voice mode      : multi-speaker")
+        speaker_ref_map = build_speaker_ref_map(
+            segments=segments,
+            source_video=Path(args.source),
+            profiles_dir=Path(args.speaker_profiles_dir),
+            global_ref=ref_audio,
+            auto_extract=args.auto_extract,
+            cache_dir=AUDIO_OUT_DIR / "speaker_refs",
+        )
+    print()
+
     manifest = synthesize_segments(
         tts=tts,
         device=device,
         segments=segments,
-        ref_audio_path=ref_audio,
+        speaker_ref_map=speaker_ref_map,
+        global_ref=ref_audio,
         output_dir=AUDIO_OUT_DIR,
         language=tts_language,
     )
@@ -545,7 +684,7 @@ def main() -> None:
     # ── Step 4: Save manifest ───────────────────
     manifest_path = ARTIFACTS_DIR / "tts_manifest.json"
     print(f"\n[4/4]  Saving TTS manifest…\n")
-    save_manifest(manifest, ref_audio, manifest_path, XTTS_MODEL_NAME)
+    save_manifest(manifest, ref_audio, speaker_ref_map, manifest_path, XTTS_MODEL_NAME)
 
     # ── Final Summary ───────────────────────────
     success = sum(1 for m in manifest if m["status"] == "success")
