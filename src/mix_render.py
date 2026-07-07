@@ -71,6 +71,16 @@ LOUDNORM_I         = -16       # EBU R128 integrated loudness target (LUFS, web)
 LOUDNORM_TP        = -1.5      # True-peak ceiling (dBTP)
 LOUDNORM_LRA       = 11        # Loudness range target
 
+# ── Phase 3B — background (M&E) bed + sidechain ducking ──
+# When the Phase F0 stems exist, the bed plays continuously under the whole
+# timeline and is ducked beneath speech (dubbed + passthrough) so dialogue
+# stays intelligible over music. Absent stems → exact pre-3B behavior.
+DEFAULT_BACKGROUND = AUDIO_OUT_DIR / "background.wav"   # Demucs no_vocals (M&E)
+DEFAULT_VOCALS     = AUDIO_OUT_DIR / "vocals.wav"       # Demucs vocals (orig speech)
+DUCK_DB            = -9.0      # bed attenuation under speech
+DUCK_ATTACK_MS     = 80        # bed dip-in ramp before/at speech onset
+DUCK_RELEASE_MS    = 200       # bed recovery ramp after speech ends
+
 
 # ──────────────────────────────────────────────
 #  Step 1 — Extract original audio for passthrough
@@ -193,16 +203,27 @@ def build_audio_timeline(
     segments_data: dict,
     source_video: Path,
     total_duration: float,
-) -> tuple[np.ndarray, list[dict]]:
+    vocals_audio: np.ndarray | None = None,
+) -> tuple[np.ndarray, list[dict], list[tuple[int, int]]]:
     """
-    Build the full-length dubbed audio timeline.
+    Build the full-length VOICE layer of the dubbed timeline.
 
     Places each segment at its original start_time position.
-    For skipped segments: extract and place original Arabic audio (Q2 decision).
-    For dubbed segments: place the time-stretched WAV.
+      - Dubbed segments  → the time-stretched TTS WAV.
+      - Skipped segments → original Arabic dialogue. When *vocals_audio* (the
+        Phase F0 vocals stem) is provided, the window is sliced from it so it
+        rides over the SAME continuous bed as everything else (no bed
+        doubling); otherwise it falls back to extracting the original full mix
+        from the source video (pre-3B behavior).
+
+    The returned timeline is ONLY speech — the background bed (if any) is added
+    and ducked by the caller, using the returned speech intervals. This keeps
+    the crossfade math operating on speech vs. speech (never against the bed).
 
     Returns:
-        (audio_timeline, placement_log)
+        (voice_timeline, placement_log, speech_intervals)
+        speech_intervals: list of (start_sample, end_sample) covering placed
+        speech, used to build the ducking envelope for the bed.
     """
     total_samples = int(total_duration * SAMPLE_RATE) + SAMPLE_RATE  # +1s buffer
     timeline = np.zeros(total_samples, dtype=np.float32)
@@ -215,6 +236,7 @@ def build_audio_timeline(
         timing_lookup[seg["segment_id"]] = seg
 
     placement_log = []
+    speech_intervals: list[tuple[int, int]] = []
     stretch_segments = stretch_manifest["segments"]
     passthrough_dir = AUDIO_OUT_DIR / "passthrough"
 
@@ -266,6 +288,7 @@ def build_audio_timeline(
                 )
 
             timeline[start_sample:start_sample + len(seg_audio)] += seg_audio
+            speech_intervals.append((start_sample, start_sample + len(seg_audio)))
 
             actual_dur = len(seg_audio) / SAMPLE_RATE
             print(f"  #{seg_id:<3}  🎙 DUBBED     "
@@ -282,20 +305,26 @@ def build_audio_timeline(
 
         # ── Skipped segment → Arabic passthrough (Q2) ──
         elif seg_entry["status"] == "skipped":
-            passthrough_file = passthrough_dir / f"passthrough_{seg_id:03d}.wav"
-
             try:
-                extract_segment_audio(
-                    source_video, start_time, orig_duration,
-                    passthrough_file, SAMPLE_RATE,
-                )
+                if vocals_audio is not None:
+                    # Slice original dialogue from the separated vocals stem, so
+                    # it rides over the SAME continuous bed (no bed doubling).
+                    end_s = start_sample + int(round(orig_duration * SAMPLE_RATE))
+                    seg_audio = vocals_audio[start_sample:end_s].copy()
+                    src_ref = _rel_or_abs(DEFAULT_VOCALS)
+                else:
+                    # Fallback (no F0 stems): extract the original full mix.
+                    passthrough_file = passthrough_dir / f"passthrough_{seg_id:03d}.wav"
+                    extract_segment_audio(
+                        source_video, start_time, orig_duration,
+                        passthrough_file, SAMPLE_RATE,
+                    )
+                    audio_data, sr = sf.read(str(passthrough_file), dtype="float32")
+                    if sr != SAMPLE_RATE:
+                        audio_data = _resample(audio_data, sr, SAMPLE_RATE)
+                    seg_audio = audio_data.copy()
+                    src_ref = _rel_or_abs(passthrough_file)
 
-                audio_data, sr = sf.read(str(passthrough_file), dtype="float32")
-
-                if sr != SAMPLE_RATE:
-                    audio_data = _resample(audio_data, sr, SAMPLE_RATE)
-
-                seg_audio = audio_data.copy()
                 apply_crossfade(timeline, start_sample, seg_audio, fade_samples, declick_samples)
 
                 end_sample = start_sample + len(seg_audio)
@@ -307,6 +336,7 @@ def build_audio_timeline(
                     )
 
                 timeline[start_sample:start_sample + len(seg_audio)] += seg_audio
+                speech_intervals.append((start_sample, start_sample + len(seg_audio)))
 
                 actual_dur = len(seg_audio) / SAMPLE_RATE
                 print(f"  #{seg_id:<3}  🌐 ARABIC     "
@@ -319,9 +349,7 @@ def build_audio_timeline(
                     "start_time": start_time,
                     "placed_duration_s": round(actual_dur, 3),
                     "original_duration_s": orig_duration,
-                    "source_file": str(
-                        passthrough_file.relative_to(PROJECT_ROOT)
-                    ).replace("\\", "/"),
+                    "source_file": src_ref,
                 })
 
             except Exception as e:
@@ -332,7 +360,88 @@ def build_audio_timeline(
                     "error": str(e),
                 })
 
-    return timeline, placement_log
+    return timeline, placement_log, speech_intervals
+
+
+# ──────────────────────────────────────────────
+#  Step 2b — Background (M&E) bed + sidechain ducking
+# ──────────────────────────────────────────────
+def load_bed(background_path: Path, n_samples: int) -> np.ndarray | None:
+    """
+    Load the Phase F0 background (M&E) stem as a mono float32 bed, fit to
+    exactly *n_samples* (pad with silence / trim). Returns None if the stem is
+    absent — the caller then behaves exactly as pre-3B (no bed).
+    """
+    if not background_path.is_file():
+        return None
+    bed, sr = sf.read(str(background_path), dtype="float32")
+    if bed.ndim > 1:
+        bed = bed.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        bed = _resample(bed, sr, SAMPLE_RATE)
+    if len(bed) < n_samples:
+        bed = np.concatenate([bed, np.zeros(n_samples - len(bed), dtype=np.float32)])
+    else:
+        bed = bed[:n_samples]
+    return bed.astype(np.float32)
+
+
+def build_duck_envelope(
+    n_samples: int,
+    speech_intervals: list[tuple[int, int]],
+    duck_db: float = DUCK_DB,
+    attack_ms: int = DUCK_ATTACK_MS,
+    release_ms: int = DUCK_RELEASE_MS,
+) -> np.ndarray:
+    """
+    Build a per-sample gain envelope for the bed: 1.0 (full) in the clear, and
+    10**(duck_db/20) under speech, with linear attack (dip-in) before each
+    speech onset and release (recovery) after each speech end. Overlapping
+    speech regions keep the bed ducked continuously (min-combined).
+    """
+    duck_gain = float(10.0 ** (duck_db / 20.0))
+    attack = max(1, int(attack_ms / 1000.0 * SAMPLE_RATE))
+    release = max(1, int(release_ms / 1000.0 * SAMPLE_RATE))
+
+    env = np.ones(n_samples, dtype=np.float32)
+    for (s, e) in speech_intervals:
+        s = max(0, min(s, n_samples))
+        e = max(0, min(e, n_samples))
+        if e <= s:
+            continue
+        # Core: fully ducked across the speech span.
+        env[s:e] = np.minimum(env[s:e], duck_gain)
+        # Attack ramp 1.0 → duck_gain, ending at s.
+        a0 = max(0, s - attack)
+        if s > a0:
+            ramp = np.linspace(1.0, duck_gain, s - a0, dtype=np.float32)
+            env[a0:s] = np.minimum(env[a0:s], ramp)
+        # Release ramp duck_gain → 1.0, starting at e.
+        r1 = min(n_samples, e + release)
+        if r1 > e:
+            ramp = np.linspace(duck_gain, 1.0, r1 - e, dtype=np.float32)
+            env[e:r1] = np.minimum(env[e:r1], ramp)
+    return env
+
+
+def mix_voice_and_bed(
+    voice: np.ndarray,
+    bed: np.ndarray | None,
+    speech_intervals: list[tuple[int, int]],
+) -> np.ndarray:
+    """
+    Sum the speech (voice) layer with the ducked background bed. With no bed
+    this returns the voice layer unchanged — byte-for-byte the pre-3B mix.
+    """
+    if bed is None:
+        return voice
+    n = len(voice)
+    if len(bed) != n:                       # keep lengths aligned defensively
+        bed = bed[:n] if len(bed) > n else np.concatenate(
+            [bed, np.zeros(n - len(bed), dtype=np.float32)]
+        )
+    env = build_duck_envelope(n, speech_intervals)
+    return voice + bed * env
 
 
 # ──────────────────────────────────────────────
@@ -446,6 +555,7 @@ def save_mix_manifest(
     output_video: Path,
     source_video: Path,
     output_path: Path,
+    background: dict | None = None,
 ) -> None:
     """Save the mix manifest as a JSON data contract."""
     dubbed_count = sum(1 for p in placement_log if p["type"] == "dubbed")
@@ -475,6 +585,7 @@ def save_mix_manifest(
         "errors": error_count,
         "skipped_segment_policy": "arabic-passthrough (Q2: Option B)",
         "lipsync_qa_policy": "manual-visual-review-only (Q3: Option B)",
+        "background": background or {"enabled": False},
         "placement_log": placement_log,
     }
 
@@ -514,6 +625,23 @@ def main() -> None:
         default=AAC_BITRATE,
         help=f"AAC audio bitrate  (default: {AAC_BITRATE})",
     )
+    parser.add_argument(
+        "--background",
+        default=str(DEFAULT_BACKGROUND),
+        help="Phase F0 background (M&E) stem to lay as a continuous bed. "
+             "Ignored if the file is absent  (default: artifacts/audio_out/background.wav)",
+    )
+    parser.add_argument(
+        "--vocals",
+        default=str(DEFAULT_VOCALS),
+        help="Phase F0 vocals stem for Arabic passthrough over the bed. "
+             "Ignored if absent  (default: artifacts/audio_out/vocals.wav)",
+    )
+    parser.add_argument(
+        "--no-background",
+        action="store_true",
+        help="Force pre-3B behavior: silent base, source-extract passthrough, no bed.",
+    )
     args = parser.parse_args()
 
     print()
@@ -543,21 +671,50 @@ def main() -> None:
     with open(segments_path, "r", encoding="utf-8") as fh:
         segments_data = json.load(fh)
 
+    # ── Resolve Phase F0 stems (background bed + vocals passthrough) ──
+    background_path = Path(args.background)
+    vocals_path = Path(args.vocals)
+    use_bed = (not args.no_background) and background_path.is_file()
+    vocals_audio = None
+    # Vocals-stem passthrough only makes sense WITH a continuous bed; without a
+    # bed, source-extract passthrough (which keeps the original background for
+    # that window) is the better fallback.
+    if use_bed and vocals_path.is_file():
+        v, vsr = sf.read(str(vocals_path), dtype="float32")
+        if v.ndim > 1:
+            v = v.mean(axis=1)
+        if vsr != SAMPLE_RATE:
+            v = _resample(v, vsr, SAMPLE_RATE)
+        vocals_audio = v.astype(np.float32)
+
+    if use_bed:
+        print(f"  Background bed  : {background_path}  (M&E)")
+        print(f"  Passthrough src : {'vocals stem' if vocals_audio is not None else 'source extract'}")
+    else:
+        print(f"  Background bed  : none (pre-3B behavior — silent base)")
+
     # ── Get source duration ──────────────────
     print(f"\n[1/4]  Probing source video duration…\n")
     total_duration = get_source_total_duration(source_video)
     print(f"  Source duration: {total_duration:.2f}s")
 
-    # ── Build audio timeline ─────────────────
+    # ── Build audio timeline (voice layer) ───
     print(f"\n[2/4]  Building audio timeline…\n")
     t_start = time.perf_counter()
 
-    timeline, placement_log = build_audio_timeline(
+    timeline, placement_log, speech_intervals = build_audio_timeline(
         stretch_manifest, segments_data, source_video, total_duration,
+        vocals_audio=vocals_audio,
     )
 
-    # Pad/trim timeline to EXACTLY the video duration (audit #36 — no -shortest)
+    # Pad/trim voice to EXACTLY the video duration (audit #36 — no -shortest)
     timeline = fit_to_duration(timeline, total_duration, SAMPLE_RATE)
+
+    # Lay the continuous M&E bed under the voice, ducked beneath speech.
+    if use_bed:
+        bed = load_bed(background_path, len(timeline))
+        timeline = mix_voice_and_bed(timeline, bed, speech_intervals)
+        print(f"\n  Background bed mixed (duck {DUCK_DB:.0f} dB under speech).")
 
     # Clip-safety only; perceptual loudness is applied by FFmpeg loudnorm at mux.
     timeline = clip_safety(timeline)
@@ -584,9 +741,20 @@ def main() -> None:
 
     # ── Save mix manifest ────────────────────
     print(f"\n  Saving mix manifest…\n")
+    bg_meta = {
+        "enabled": bool(use_bed),
+        "background_file": _rel_or_abs(background_path) if use_bed else None,
+        "passthrough_source": (
+            ("vocals-stem" if vocals_audio is not None else "source-extract")
+            if use_bed else "source-extract"
+        ),
+        "duck_db": DUCK_DB if use_bed else None,
+        "duck_attack_ms": DUCK_ATTACK_MS if use_bed else None,
+        "duck_release_ms": DUCK_RELEASE_MS if use_bed else None,
+    }
     save_mix_manifest(
         placement_log, output_audio, output_video,
-        source_video, MIX_MANIFEST,
+        source_video, MIX_MANIFEST, background=bg_meta,
     )
 
     # ── Final banner ─────────────────────────
