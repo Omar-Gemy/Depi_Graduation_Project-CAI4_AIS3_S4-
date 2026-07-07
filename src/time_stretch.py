@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,9 +54,47 @@ MAX_STRETCH_RATIO   = 2.0     # Never compress beyond 2.0× (Q1 decision)
 TIER1_THRESHOLD     = 1.15    # Below this ratio → trivial / no-stretch
 FIT_TOLERANCE       = 0.05    # 50ms tolerance — segment "fits" if within this
 
+# Over-cap segments get a short fade-out on the trimmed tail to de-click the
+# overflow edge (audit #27).
+OVERCAP_FADE_MS     = 10
+
 
 # ──────────────────────────────────────────────
-#  Time-stretch via FFmpeg atempo filter
+#  Time-stretch engine selection (Rubber Band → atempo)
+# ──────────────────────────────────────────────
+def _rubberband_available() -> bool:
+    """True if both the pyrubberband wrapper and the rubberband CLI are present."""
+    try:
+        import pyrubberband  # noqa: F401
+    except Exception:
+        return False
+    return shutil.which("rubberband") is not None
+
+
+def _stretch_with_rubberband(
+    input_path: Path,
+    output_path: Path,
+    speed_factor: float,
+) -> Path:
+    """
+    Time-stretch using Rubber Band (formant-preserving WSOLA) via pyrubberband.
+
+    speed_factor > 1.0 → compress (speak faster).  pyrubberband's `rate`
+    argument uses the same convention (rate > 1.0 shortens the clip), so the
+    factor passes through unchanged. Preserves the input sample rate.
+    """
+    import pyrubberband as pyrb
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    y, sr = sf.read(str(input_path), dtype="float32")
+    # Formant preservation keeps the cloned timbre natural under compression.
+    stretched = pyrb.time_stretch(y, sr, speed_factor, rbargs={"-F": ""})
+    sf.write(str(output_path), stretched, sr, subtype="PCM_16")
+    return output_path
+
+
+# ──────────────────────────────────────────────
+#  Time-stretch via FFmpeg atempo filter (fallback)
 # ──────────────────────────────────────────────
 def _stretch_with_ffmpeg(
     input_path: Path,
@@ -109,6 +148,46 @@ def _stretch_with_ffmpeg(
         )
 
     return output_path
+
+
+# ──────────────────────────────────────────────
+#  Engine dispatch + tail de-click
+# ──────────────────────────────────────────────
+_STRETCH_ENGINE = None  # resolved once, lazily: "rubberband" | "ffmpeg"
+
+
+def _stretch_segment(
+    input_path: Path,
+    output_path: Path,
+    speed_factor: float,
+) -> Path:
+    """
+    Stretch via Rubber Band when available (best speech quality), else fall
+    back to FFmpeg atempo. Engine is resolved once and reported on first use.
+    """
+    global _STRETCH_ENGINE
+    if _STRETCH_ENGINE is None:
+        _STRETCH_ENGINE = "rubberband" if _rubberband_available() else "ffmpeg"
+        label = ("Rubber Band (formant-preserving)"
+                 if _STRETCH_ENGINE == "rubberband"
+                 else "FFmpeg atempo (rubberband-cli not found)")
+        print(f"  Time-stretch engine: {label}\n")
+
+    if _STRETCH_ENGINE == "rubberband":
+        try:
+            return _stretch_with_rubberband(input_path, output_path, speed_factor)
+        except Exception as e:
+            print(f"    ⚠ rubberband failed ({e}) — falling back to atempo")
+    return _stretch_with_ffmpeg(input_path, output_path, speed_factor)
+
+
+def _apply_tail_fade(path: Path, fade_ms: float) -> None:
+    """Fade the trailing *fade_ms* to zero in-place, de-clicking a hard tail."""
+    y, sr = sf.read(str(path), dtype="float32")
+    n = int(fade_ms / 1000.0 * sr)
+    if 0 < n < len(y):
+        y[-n:] *= np.linspace(1.0, 0.0, n, dtype=np.float32)
+        sf.write(str(path), y, sr, subtype="PCM_16")
 
 
 # ──────────────────────────────────────────────
@@ -258,7 +337,10 @@ def process_segment(
     else:
         # ── Apply time-stretch ───────────────
         try:
-            _stretch_with_ffmpeg(input_file, out_path, speed_factor)
+            _stretch_segment(input_file, out_path, speed_factor)
+            # De-click the trimmed tail of over-cap (overflowing) segments.
+            if tier == "over-cap":
+                _apply_tail_fade(out_path, OVERCAP_FADE_MS)
             info = sf.info(str(out_path))
             output_duration = round(info.duration, 3)
 

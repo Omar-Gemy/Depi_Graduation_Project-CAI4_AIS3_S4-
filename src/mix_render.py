@@ -39,6 +39,12 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+try:
+    from scipy.signal import resample_poly
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
 # ──────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────
@@ -57,9 +63,13 @@ MIX_MANIFEST       = ARTIFACTS_DIR / "mix_manifest.json"
 # ──────────────────────────────────────────────
 #  Audio constants
 # ──────────────────────────────────────────────
-SAMPLE_RATE        = 22050     # Match XTTS v2 native rate
-CROSSFADE_MS       = 15        # Crossfade duration at boundaries
+SAMPLE_RATE        = 24000     # XTTS v2 native output rate → dubbed segs need no resample
+CROSSFADE_MS       = 30        # Equal-power crossfade at real segment overlaps
+DECLICK_MS         = 5         # Tiny head/tail fade to kill boundary pops
 AAC_BITRATE        = "192k"    # Q4 decision: AAC 192k
+LOUDNORM_I         = -16       # EBU R128 integrated loudness target (LUFS, web)
+LOUDNORM_TP        = -1.5      # True-peak ceiling (dBTP)
+LOUDNORM_LRA       = 11        # Loudness range target
 
 
 # ──────────────────────────────────────────────
@@ -120,37 +130,62 @@ def get_source_total_duration(source_video: Path) -> float:
 # ──────────────────────────────────────────────
 #  Step 2 — Build the full-length audio timeline
 # ──────────────────────────────────────────────
+def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """
+    Anti-aliased resample. Uses scipy polyphase (resample_poly) when available;
+    falls back to linear interpolation only if scipy is missing. At the 24 kHz
+    pipeline rate, dubbed segments already match and skip this entirely.
+    """
+    if src_sr == dst_sr:
+        return audio.astype(np.float32, copy=False)
+    if _HAVE_SCIPY:
+        from math import gcd
+        g = gcd(src_sr, dst_sr)
+        return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
+    # Fallback: linear interpolation (aliasing-prone) — kept only for safety.
+    old_len = len(audio)
+    new_len = int(old_len * dst_sr / src_sr)
+    return np.interp(
+        np.linspace(0, old_len - 1, new_len),
+        np.arange(old_len),
+        audio,
+    ).astype(np.float32)
+
+
 def apply_crossfade(
     audio: np.ndarray,
     position: int,
     segment: np.ndarray,
     fade_samples: int,
+    declick_samples: int,
 ) -> None:
     """
-    Apply a crossfade when placing a segment into the timeline.
-    Fades in the segment's leading edge and fades out the
-    timeline's existing content at the overlap zone.
+    Prepare a segment for additive placement into the timeline.
+
+    Two distinct operations (audit #29/#30):
+      1. De-click: a very short (declick_samples) fade on the segment's head and
+         tail so it can't pop when it starts/ends over silence.
+      2. Equal-power crossfade: applied ONLY where the segment's head overlaps
+         existing non-zero timeline content (a real adjacent-segment boundary).
+         Both sides use sqrt gains so summed energy stays constant — no dip.
     """
     seg_len = len(segment)
 
-    # Apply fade-in to the segment itself
-    if fade_samples > 0 and seg_len > fade_samples:
-        fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-        segment[:fade_samples] *= fade_in
+    # 1. De-click head & tail (always) ────────────
+    d = min(declick_samples, seg_len // 2)
+    if d > 0:
+        segment[:d] *= np.linspace(0.0, 1.0, d, dtype=np.float32)
+        segment[-d:] *= np.linspace(1.0, 0.0, d, dtype=np.float32)
 
-        # Fade out existing audio in the overlap zone
-        overlap_start = position
-        overlap_end = min(position + fade_samples, len(audio))
-        overlap_len = overlap_end - overlap_start
-
-        if overlap_len > 0:
-            fade_out = np.linspace(1.0, 0.0, overlap_len, dtype=np.float32)
-            audio[overlap_start:overlap_end] *= fade_out
-
-    # Apply fade-out to the segment's trailing edge
-    if fade_samples > 0 and seg_len > fade_samples:
-        fade_out_seg = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
-        segment[-fade_samples:] *= fade_out_seg
+    # 2. Equal-power crossfade at real overlaps ───
+    f = min(fade_samples, seg_len)
+    if f > 0:
+        head_end = min(position + f, len(audio))
+        hlen = head_end - position
+        if hlen > 0 and np.any(audio[position:head_end] != 0.0):
+            t = np.linspace(0.0, 1.0, hlen, dtype=np.float32)
+            segment[:hlen] *= np.sqrt(t)              # equal-power fade-in
+            audio[position:head_end] *= np.sqrt(1.0 - t)  # equal-power fade-out
 
 
 def build_audio_timeline(
@@ -172,6 +207,7 @@ def build_audio_timeline(
     total_samples = int(total_duration * SAMPLE_RATE) + SAMPLE_RATE  # +1s buffer
     timeline = np.zeros(total_samples, dtype=np.float32)
     fade_samples = int(CROSSFADE_MS / 1000.0 * SAMPLE_RATE)
+    declick_samples = int(DECLICK_MS / 1000.0 * SAMPLE_RATE)
 
     # Build a lookup from segment_id → timing info
     timing_lookup = {}
@@ -210,21 +246,14 @@ def build_audio_timeline(
             # Read the audio segment
             audio_data, sr = sf.read(str(wav_path), dtype="float32")
 
-            # Resample if needed
+            # Resample to the pipeline rate if needed (dubbed = 24 kHz → no-op)
             if sr != SAMPLE_RATE:
-                # Simple resample via linear interpolation
-                old_len = len(audio_data)
-                new_len = int(old_len * SAMPLE_RATE / sr)
-                audio_data = np.interp(
-                    np.linspace(0, old_len - 1, new_len),
-                    np.arange(old_len),
-                    audio_data,
-                ).astype(np.float32)
+                audio_data = _resample(audio_data, sr, SAMPLE_RATE)
 
             seg_audio = audio_data.copy()
 
             # Apply crossfade
-            apply_crossfade(timeline, start_sample, seg_audio, fade_samples)
+            apply_crossfade(timeline, start_sample, seg_audio, fade_samples, declick_samples)
 
             # Place into timeline
             end_sample = start_sample + len(seg_audio)
@@ -264,16 +293,10 @@ def build_audio_timeline(
                 audio_data, sr = sf.read(str(passthrough_file), dtype="float32")
 
                 if sr != SAMPLE_RATE:
-                    old_len = len(audio_data)
-                    new_len = int(old_len * SAMPLE_RATE / sr)
-                    audio_data = np.interp(
-                        np.linspace(0, old_len - 1, new_len),
-                        np.arange(old_len),
-                        audio_data,
-                    ).astype(np.float32)
+                    audio_data = _resample(audio_data, sr, SAMPLE_RATE)
 
                 seg_audio = audio_data.copy()
-                apply_crossfade(timeline, start_sample, seg_audio, fade_samples)
+                apply_crossfade(timeline, start_sample, seg_audio, fade_samples, declick_samples)
 
                 end_sample = start_sample + len(seg_audio)
                 if end_sample > len(timeline):
@@ -315,15 +338,28 @@ def build_audio_timeline(
 # ──────────────────────────────────────────────
 #  Step 3 — Normalise and save the final audio
 # ──────────────────────────────────────────────
-def normalize_audio(audio: np.ndarray, target_peak: float = 0.9) -> np.ndarray:
+def clip_safety(audio: np.ndarray) -> np.ndarray:
     """
-    Peak-normalise the audio to the target peak level.
-    Prevents clipping while maintaining loudness.
+    Hard-limit samples to [-1, 1] to prevent WAV wrap-around before encoding.
+    Perceived loudness is handled later by FFmpeg loudnorm (EBU R128), not by
+    peak scaling here — a single loud sample no longer drags the whole track
+    quiet (audit #32/#1).
     """
-    peak = np.max(np.abs(audio))
-    if peak > 0:
-        audio = audio * (target_peak / peak)
-    return audio
+    return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+
+def fit_to_duration(audio: np.ndarray, duration_s: float,
+                    sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """
+    Pad (with silence) or trim the timeline to exactly match the video
+    duration, so the mux never has to trim the video (audit #36).
+    """
+    target = int(round(duration_s * sample_rate))
+    if len(audio) < target:
+        return np.concatenate(
+            [audio, np.zeros(target - len(audio), dtype=np.float32)]
+        )
+    return audio[:target]
 
 
 def save_final_audio(
@@ -362,11 +398,12 @@ def render_final_video(
         "-i", str(source_video),        # video source
         "-i", str(dubbed_audio),         # new audio
         "-c:v", "copy",                  # copy video stream (no re-encode)
+        "-af",                           # EBU R128 loudness normalization (web -16 LUFS)
+        f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}",
         "-c:a", "aac",                   # encode audio as AAC
         "-b:a", audio_bitrate,           # bitrate (192k)
         "-map", "0:v:0",                 # take video from first input
         "-map", "1:a:0",                 # take audio from second input
-        "-shortest",                     # trim to shortest stream
         str(output_video),
     ]
 
@@ -375,6 +412,7 @@ def render_final_video(
     print(f"    Audio source : {dubbed_audio}")
     print(f"    Output       : {output_video}")
     print(f"    Audio codec  : AAC @ {audio_bitrate}")
+    print(f"    Loudness     : EBU R128  I={LOUDNORM_I} TP={LOUDNORM_TP} LRA={LOUDNORM_LRA}")
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
@@ -518,13 +556,11 @@ def main() -> None:
         stretch_manifest, segments_data, source_video, total_duration,
     )
 
-    # Trim timeline to source duration
-    target_samples = int(total_duration * SAMPLE_RATE)
-    if len(timeline) > target_samples:
-        timeline = timeline[:target_samples]
+    # Pad/trim timeline to EXACTLY the video duration (audit #36 — no -shortest)
+    timeline = fit_to_duration(timeline, total_duration, SAMPLE_RATE)
 
-    # Normalise
-    timeline = normalize_audio(timeline, target_peak=0.9)
+    # Clip-safety only; perceptual loudness is applied by FFmpeg loudnorm at mux.
+    timeline = clip_safety(timeline)
 
     t_build = time.perf_counter() - t_start
     print(f"\n  Timeline built in {t_build:.1f}s")
