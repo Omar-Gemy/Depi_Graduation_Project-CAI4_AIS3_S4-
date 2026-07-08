@@ -74,6 +74,23 @@ SPEAKER_UNKNOWN_LABEL = "SPEAKER_UNKNOWN"   # diarization catch-all bucket
 MIN_SPEAKER_REF_SEC   = 3.0                 # min clean audio for a dedicated clone
 MAX_SPEAKER_REF_SEC   = 8.0                 # cap the extracted reference window
 
+# XTTS v2 generation controls (forwarded through tts_to_file → Xtts.inference).
+# Verified against coqui-tts 0.27.5. Defaults tuned for dubbing: warmer than
+# flat greedy output, but tightly controlled to avoid rambling/hallucination.
+#   • repetition_penalty 5.0 (< the 10.0 XTTS default) → less clipped, more
+#     natural prosody without runaway repeats.
+#   • enable_text_splitting → long lines are chunked so intonation resets
+#     naturally instead of degrading across a single long generation.
+XTTS_GEN_DEFAULTS = {
+    "temperature": 0.70,
+    "length_penalty": 1.0,
+    "repetition_penalty": 5.0,
+    "top_k": 50,
+    "top_p": 0.85,
+    "speed": 1.0,
+    "enable_text_splitting": True,
+}
+
 # Fallback reference extraction window (only used if voice_ref.wav
 # is missing and --auto-extract is enabled)
 FALLBACK_REF_START = 2.5      # seconds — start of segment #1
@@ -326,6 +343,7 @@ def synthesize_segments(
     global_ref: Path,
     output_dir: Path,
     language: str,
+    gen_params: dict | None = None,
 ) -> list[dict]:
     """
     Iterate over translated segments from translation.json,
@@ -351,6 +369,16 @@ def synthesize_segments(
     synthesized_count = 0
     skipped_count = 0
     failed_count = 0
+
+    # XTTS generation controls (temperature, repetition_penalty, …). Forwarded
+    # to tts_to_file → Xtts.inference. Falls back to the tuned defaults.
+    gen = dict(XTTS_GEN_DEFAULTS)
+    if gen_params:
+        gen.update({k: v for k, v in gen_params.items() if v is not None})
+    print(f"  XTTS gen params : temp={gen['temperature']} "
+          f"rep_pen={gen['repetition_penalty']} top_k={gen['top_k']} "
+          f"top_p={gen['top_p']} speed={gen['speed']} "
+          f"split={gen['enable_text_splitting']}")
 
     t_start_all = time.perf_counter()
 
@@ -407,6 +435,7 @@ def synthesize_segments(
                     file_path=str(out_path),
                     speaker_wav=str(ref_path),
                     language=language,
+                    **gen,
                 )
 
             # Verify the output file was actually created
@@ -608,6 +637,31 @@ def main() -> None:
         action="store_true",
         help="Force one shared voice for all speakers (pre-Phase-2 behavior).",
     )
+    # XTTS generation controls (override the tuned defaults by ear).
+    parser.add_argument(
+        "--temperature", type=float, default=None,
+        help=f"XTTS sampling temperature (default: {XTTS_GEN_DEFAULTS['temperature']}).",
+    )
+    parser.add_argument(
+        "--repetition-penalty", type=float, default=None,
+        help=f"XTTS repetition penalty (default: {XTTS_GEN_DEFAULTS['repetition_penalty']}).",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=None,
+        help=f"XTTS top-k (default: {XTTS_GEN_DEFAULTS['top_k']}).",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=None,
+        help=f"XTTS top-p (default: {XTTS_GEN_DEFAULTS['top_p']}).",
+    )
+    parser.add_argument(
+        "--length-penalty", type=float, default=None,
+        help=f"XTTS length penalty (default: {XTTS_GEN_DEFAULTS['length_penalty']}).",
+    )
+    parser.add_argument(
+        "--speed", type=float, default=None,
+        help=f"XTTS speaking rate multiplier (default: {XTTS_GEN_DEFAULTS['speed']}).",
+    )
     args = parser.parse_args()
 
     print()
@@ -671,6 +725,16 @@ def main() -> None:
         )
     print()
 
+    # CLI overrides for XTTS generation (None → keep tuned default).
+    gen_params = {
+        "temperature": args.temperature,
+        "repetition_penalty": args.repetition_penalty,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "length_penalty": args.length_penalty,
+        "speed": args.speed,
+    }
+
     manifest = synthesize_segments(
         tts=tts,
         device=device,
@@ -679,6 +743,7 @@ def main() -> None:
         global_ref=ref_audio,
         output_dir=AUDIO_OUT_DIR,
         language=tts_language,
+        gen_params=gen_params,
     )
 
     # ── Step 4: Save manifest ───────────────────
